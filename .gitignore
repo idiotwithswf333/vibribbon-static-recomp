@@ -1,0 +1,7 @@
+build/
+assets/
+*.bin
+*.cue
+*.iso
+*.exe
+!tools/*.exe

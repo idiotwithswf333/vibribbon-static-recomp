@@ -8,6 +8,7 @@
 
 #include <cstdio>
 
+#include "disc.h"
 #include "pad_map.h"
 
 namespace {
@@ -67,6 +68,25 @@ uint16_t read_keyboard() {
     return w;
 }
 
+// Loads a dropped .cue. Returns a status line for the window title and sets
+// `ok` when it is a recognisable Vib-Ribbon disc. The game itself cannot run
+// yet, so "loaded" means: disc parsed and the boot executables read into memory.
+std::string load_dropped_disc(const std::string& cue, bool& ok) {
+    ok = false;
+    disc::Image img;
+    std::string err = img.open(cue);
+    if (!err.empty()) return "Error: " + err;
+    std::string boot = disc::boot_file(img);
+    std::vector<uint8_t> f;
+    disc::PsxExe loader, title;
+    if (boot.empty() || !img.read_file(boot, f) || !disc::parse_psx_exe(f, loader))
+        return "Error: no bootable PS1 executable on disc";
+    if (boot != "SCES_028.73" || !img.read_file("MAIN_T.EXE", f) || !disc::parse_psx_exe(f, title))
+        return "Loaded disc " + boot + " (not the Vib-Ribbon EU release)";
+    ok = true;
+    return "Vib-Ribbon (EU) disc OK - boot " + boot + ", MAIN_T.EXE ready. Game execution not implemented yet.";
+}
+
 // Placeholder for the recompiled game. Returns the pad word (active-low, as
 // the PS1 library would see it) for port 1 so the HLE pad layer can be wired
 // in later.
@@ -93,9 +113,18 @@ int main(int, char**) {
     open_first_controller();
 
     uint16_t last = 0xFFFF;
+    int disc_state = 0;  // 0 none, 1 recognised Vib-Ribbon disc, 2 error / other disc
     for (bool running = true; running;) {
         for (SDL_Event e; SDL_PollEvent(&e);) {
             if (e.type == SDL_QUIT) running = false;
+            if (e.type == SDL_DROPFILE) {
+                bool ok;
+                std::string msg = load_dropped_disc(e.drop.file, ok);
+                SDL_SetWindowTitle(win, msg.c_str());
+                std::printf("%s\n", msg.c_str());
+                disc_state = ok ? 1 : 2;
+                SDL_free(e.drop.file);
+            }
             if (e.type == SDL_CONTROLLERDEVICEADDED) open_first_controller();
             if (e.type == SDL_CONTROLLERDEVICEREMOVED && g_pad &&
                 e.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pad))) {
@@ -110,7 +139,9 @@ int main(int, char**) {
             std::printf("pad word (active-low): 0x%04X\n", wire);
             last = wire;
         }
-        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        if (disc_state == 1) SDL_SetRenderDrawColor(ren, 0, 40, 0, 255);
+        else if (disc_state == 2) SDL_SetRenderDrawColor(ren, 50, 0, 0, 255);
+        else SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
         SDL_RenderClear(ren);
         SDL_RenderPresent(ren);
     }

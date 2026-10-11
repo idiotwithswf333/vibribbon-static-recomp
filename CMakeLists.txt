@@ -17,3 +17,5 @@ target_link_libraries(vibribbon PRIVATE SDL2::SDL2main SDL2::SDL2-static)
 enable_testing()
 add_executable(pad_map_test tests/pad_map_test.cpp)
 add_test(NAME pad_map COMMAND pad_map_test)
+
+add_executable(disc_info tests/disc_info.cpp)  # manual: disc_info game.cue (needs your disc)

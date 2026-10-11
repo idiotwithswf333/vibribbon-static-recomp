@@ -13,11 +13,15 @@ should ever be committed.** You supply your own legally obtained disc.
 | SDL2 window + gamepad layer | Written, not yet compiled with SDL |
 | Xbox 360 -> PS1 pad mapping (`src/pad_map.h`) | Done, unit tested |
 | splat configs (`config/`) | Untested starting points |
-| Game code (disassembly -> C++/recompiled) | **Not started** |
+| MIPS R3000 interpreter + BIOS/syscall/interrupt HLE (`src/cpu.h`) | Works, unit tested (`tests/cpu_test.cpp`) |
+| Boot loader (`SCES_028.73`) on the interpreter | Runs: prints "Loader main()", handles vblank IRQs, then waits for the CD-ROM |
+| CD-ROM controller, GPU, SPU, GTE | **Not started** (next: CD-ROM, so the loader can load `MAIN_T.EXE`) |
+| Native recompilation of game code | Not started (interpreter-first approach; recompile later for speed) |
 | GPU / SPU / CD / pad HLE | **Not started** |
 
-Right now `vibribbon.exe` opens a window and reads your controller. It does not
-run the game yet.
+Right now `vibribbon.exe` opens a window, reads your controller, and recognises
+the disc you drop on it. It does not run the game yet. The CPU core can already
+boot the game's loader headlessly: `boot_trace vibribbon.cue SCES_028.73`.
 
 ## Controls
 

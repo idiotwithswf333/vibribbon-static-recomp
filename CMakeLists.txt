@@ -19,3 +19,7 @@ add_executable(pad_map_test tests/pad_map_test.cpp)
 add_test(NAME pad_map COMMAND pad_map_test)
 
 add_executable(disc_info tests/disc_info.cpp)  # manual: disc_info game.cue (needs your disc)
+
+add_executable(cpu_test tests/cpu_test.cpp)
+add_test(NAME cpu COMMAND cpu_test)
+add_executable(boot_trace tests/boot_trace.cpp)  # manual: boot_trace game.cue [EXE] [max_instr]

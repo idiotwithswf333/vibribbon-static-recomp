@@ -11,6 +11,7 @@
 
 #include "cpu.h"
 #include "disc.h"
+#include <initializer_list>
 #include "pad_map.h"
 
 namespace {
@@ -51,19 +52,28 @@ pad::XboxState read_controller() {
     return s;
 }
 
+// Keyboard -> PS1 pad. Several keys per button so any common layout works.
+//   D-pad: arrows or W/A/S/D     Cross: Z, Space      Circle: X
+//   Square: C                    Triangle: V          Start: Enter / Keypad Enter
+//   Select: Right Shift / Backspace     L1/R1: Q/E     L2/R2: 1/3
 uint16_t read_keyboard() {
     const Uint8* k = SDL_GetKeyboardState(nullptr);
+    auto any = [&](std::initializer_list<SDL_Scancode> l) { for (auto sc : l) if (k[sc]) return true; return false; };
     uint16_t w = 0;
-    if (k[SDL_SCANCODE_UP]) w |= pad::UP;
-    if (k[SDL_SCANCODE_DOWN]) w |= pad::DOWN;
-    if (k[SDL_SCANCODE_LEFT]) w |= pad::LEFT;
-    if (k[SDL_SCANCODE_RIGHT]) w |= pad::RIGHT;
-    if (k[SDL_SCANCODE_Z]) w |= pad::CROSS;
-    if (k[SDL_SCANCODE_X]) w |= pad::CIRCLE;
-    if (k[SDL_SCANCODE_A]) w |= pad::SQUARE;
-    if (k[SDL_SCANCODE_S]) w |= pad::TRIANGLE;
-    if (k[SDL_SCANCODE_RETURN]) w |= pad::START;
-    if (k[SDL_SCANCODE_RSHIFT]) w |= pad::SELECT;
+    if (any({SDL_SCANCODE_UP, SDL_SCANCODE_W})) w |= pad::UP;
+    if (any({SDL_SCANCODE_DOWN, SDL_SCANCODE_S})) w |= pad::DOWN;
+    if (any({SDL_SCANCODE_LEFT, SDL_SCANCODE_A})) w |= pad::LEFT;
+    if (any({SDL_SCANCODE_RIGHT, SDL_SCANCODE_D})) w |= pad::RIGHT;
+    if (any({SDL_SCANCODE_Z, SDL_SCANCODE_SPACE})) w |= pad::CROSS;
+    if (any({SDL_SCANCODE_X})) w |= pad::CIRCLE;
+    if (any({SDL_SCANCODE_C})) w |= pad::SQUARE;
+    if (any({SDL_SCANCODE_V})) w |= pad::TRIANGLE;
+    if (any({SDL_SCANCODE_RETURN, SDL_SCANCODE_KP_ENTER})) w |= pad::START;
+    if (any({SDL_SCANCODE_RSHIFT, SDL_SCANCODE_BACKSPACE})) w |= pad::SELECT;
+    if (any({SDL_SCANCODE_Q})) w |= pad::L1;
+    if (any({SDL_SCANCODE_E})) w |= pad::R1;
+    if (any({SDL_SCANCODE_1})) w |= pad::L2;
+    if (any({SDL_SCANCODE_3})) w |= pad::R2;
     return w;
 }
 
@@ -159,6 +169,8 @@ int main(int argc, char** argv) {
         SDL_RenderClear(ren);
         if (emu.cpu) {
             emu.cpu->pad1 = pad::to_ps1(read_controller()) | read_keyboard();
+            static uint16_t last_pad = 0;   // log pad changes so you can see the keyboard is being read
+            if (emu.cpu->pad1 != last_pad) { last_pad = emu.cpu->pad1; std::fprintf(stderr, "pad: %04X\n", last_pad); }
             if (!emu.cpu->run_frame() && emu.cpu->halted) {
                 std::string m = "CPU stopped: " + emu.cpu->halt_reason;
                 SDL_SetWindowTitle(win, m.c_str());

@@ -29,7 +29,7 @@ Xbox 360 controller (any SDL-supported pad works):
 | LT / RT | L2 / R2 |
 | Start / Back | Start / Select |
 
-Keyboard fallback: arrows, Z=Cross, X=Circle, A=Square, S=Triangle, Enter=Start, Right Shift=Select.
+Keyboard: arrows or WASD = D-pad, Z/Space = Cross, X = Circle, C = Square, V = Triangle, Enter = Start, Right Shift/Backspace = Select, Q/E = L1/R1, 1/3 = L2/R2. Every change in pad state is logged to stderr as `pad: XXXX` (active-high bits, see `pad_map.h`).
 
 ## Status (honest)
 

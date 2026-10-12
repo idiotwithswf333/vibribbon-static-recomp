@@ -12,16 +12,23 @@
 #include <string>
 #include <vector>
 
+#include "cdrom.h"
+#include "disc.h"
+#include "gpu.h"
+#include "gte.h"
+
 namespace cpu {
 
 struct Trace {
     std::map<std::string, uint64_t> bios_calls;   // "A0:3F printf" -> count
     std::map<uint32_t, uint64_t> io_reads, io_writes;  // physical addr -> count
     std::map<uint32_t, uint32_t> io_first_write;       // physical addr -> first value
+    std::map<uint32_t, uint64_t> dma_runs, gte_cmds, gte_moves;
     std::map<uint32_t, uint64_t> pc_hist, calls;   // calls: jal/jalr target -> count
-    uint64_t gte_ops = 0, unknown_ops = 0, syscalls = 0, printf_calls = 0;
+    uint64_t execs = 0, dma_other = 0, gte_ops = 0, unknown_ops = 0, syscalls = 0, printf_calls = 0;
     std::string log;      // printf output and notable events
     bool verbose_bios = false;
+    bool enabled = true;   // per-instruction statistics (slow); turn off for play
 };
 
 class Cpu {
@@ -34,6 +41,11 @@ public:
     uint8_t io[0x2000] = {};
     bool halted = false;
     std::string halt_reason;
+    hw::CdRom cd;
+    hw::Gpu gpu;
+    hw::Gte gte;
+    std::vector<uint8_t> spu_ram = std::vector<uint8_t>(512 * 1024);
+    void attach_disc(disc::Image* d) { cd.img = d; }
 
     // ---- memory ---------------------------------------------------------
     static uint32_t phys(uint32_t a) { return a >= 0xFFFE0000u ? a : (a & 0x1FFFFFFFu); }
@@ -76,7 +88,7 @@ public:
         uint32_t cur = pc;
         uint32_t i = read(cur, 4);
         if (halted) return;
-        trace.pc_hist[cur]++;
+        if (trace.enabled) trace.pc_hist[cur]++;
         pc = next_pc; next_pc += 4;
         prev = pend; pend = {};
         wreg = 0;
@@ -84,9 +96,18 @@ public:
         if (prev.reg && prev.reg != wreg && prev.reg != pend.reg) r[prev.reg] = prev.val;
         r[0] = 0;
         ++icount;
+        if (cd.tick(icount)) irq_set(2);
+        if (ack_due && icount >= ack_due) { ack_due = 0; sio_irq = true; if (rd(&io[0x4A], 2) & 0x1000) irq_set(7); }
         if (icount % 677376 == 0) { uint32_t st = rd(&io[0x70], 4) | 1u; wr(&io[0x70], st, 4); ++vblanks; }  // PAL 50 Hz
     }
     uint64_t vblanks = 0, irqs_taken = 0;
+    uint16_t pad1 = 0;   // controller 1, ACTIVE-HIGH (see pad_map.h); set by the frontend
+    // Runs until the next vblank has occurred (or max instructions). Returns false if halted.
+    bool run_frame(uint64_t max_instr = 2000000) {
+        uint64_t v = vblanks, n = 0;
+        while (!halted && vblanks == v && n++ < max_instr) step();
+        return !halted;
+    }
 
 private:
     struct Pend { uint32_t reg = 0, val = 0; };
@@ -104,10 +125,14 @@ private:
     static void wr(uint8_t* p, uint32_t v, int s) { std::memcpy(p, &v, s); }
 
     uint32_t io_read(uint32_t a, int size) {
-        trace.io_reads[a]++;
+        if (trace.enabled) trace.io_reads[a]++;
         uint32_t off = a - 0x1F801000;
-        if (a == 0x1F801814) { gpustat_toggle ^= 0x80000000u; return 0x1C000000u | gpustat_toggle; }
-        if (a == 0x1F801810) return 0;
+        if (a == 0x1F801040) { sio_rx_ready = false; return sio_rx; }
+        if (a == 0x1F801044) return 0x5u | (sio_rx_ready ? 2u : 0u) | (sio_irq ? 0x200u : 0u) | 0x80u * (!sio_irq);
+        if (a == 0x1F801814) return gpu.stat();
+        if (a >= 0x1F801800 && a <= 0x1F801803) return cd.read8(a - 0x1F801800);
+        if (a == 0x1F801DAE) return rd(&io[0xDAA], 2) & 0x3F;   // SPUSTAT mirrors SPUCNT's low bits
+        if (a == 0x1F801810) return gpu.read_gpuread();
         // Root counters: current values derived from elapsed instructions (~1 cycle each).
         if (a == 0x1F801100) return (uint32_t)((icount / 6) & 0xFFFF);      // dot clock
         if (a == 0x1F801110) return (uint32_t)((icount / 2169) & 0xFFFF);   // hblank (PAL line)
@@ -115,10 +140,28 @@ private:
         return rd(&io[off], size);
     }
     void io_write(uint32_t a, uint32_t v, int size) {
-        trace.io_writes[a]++;
-        if (!trace.io_first_write.count(a)) trace.io_first_write[a] = v;
+        if (trace.enabled) { trace.io_writes[a]++; if (!trace.io_first_write.count(a)) trace.io_first_write[a] = v; }
         uint32_t off = a - 0x1F801000;
+        if (a >= 0x1F801800 && a <= 0x1F801803) { cd.write8(a - 0x1F801800, (uint8_t)v); return; }
+        if (a == 0x1F801040) { sio_tx((uint8_t)v); return; }
+        if (a == 0x1F80104A) {
+            wr(&io[off], v, 2);
+            if (v & 0x40) { sio_idx = 0; sio_rx_ready = false; sio_irq = false; ack_due = 0; }   // reset
+            if (v & 0x10) sio_irq = false;                                                   // acknowledge
+            if (!(v & 2)) { sio_idx = 0; ack_due = 0; }                                       // DTR low: deselect
+            return;
+        }
+        if (a == 0x1F801810) { gpu.gp0(v); return; }
+        if (a == 0x1F801814) { gpu.gp1(v); return; }
         if (a == 0x1F801070) { wr(&io[off], rd(&io[off], 4) & v, 4); return; }  // I_STAT: write-0-to-ack
+        if (a == 0x1F8010F4) {   // DICR: flags (bits 24-30) are write-1-to-clear
+            uint32_t old = rd(&io[off], 4);
+            uint32_t nv = (old & 0x7F000000u & ~(v & 0x7F000000u)) | (v & 0x00FFFFFFu);
+            wr(&io[off], nv, 4); dicr_update(); return;
+        }
+        if (a >= 0x1F801088 && a <= 0x1F8010E8 && ((a & 0xF) == 8) && (v & 0x01000000u)) {
+            wr(&io[off], v, 4); dma_run((a - 0x1F801080) >> 4); return;
+        }
         wr(&io[off], v, size);
     }
 
@@ -140,7 +183,7 @@ private:
             case 0x06: set(rd_, B >> (A & 31)); break;
             case 0x07: set(rd_, (int32_t)B >> (A & 31)); break;
             case 0x08: next_pc = A; break;
-            case 0x09: { uint32_t t = A; set(rd_, cur + 8); next_pc = t; trace.calls[t]++; break; }
+            case 0x09: { uint32_t t = A; set(rd_, cur + 8); next_pc = t; if (trace.enabled) trace.calls[t]++; break; }
             case 0x0C: syscall(); break;
             case 0x0D: halt("BREAK executed"); break;
             case 0x10: set(rd_, hi); break;
@@ -178,7 +221,7 @@ private:
             }
             break;
         case 0x02: next_pc = (cur & 0xF0000000u) | ((i & 0x3FFFFFF) << 2); break;
-        case 0x03: set(31, cur + 8); next_pc = (cur & 0xF0000000u) | ((i & 0x3FFFFFF) << 2); trace.calls[next_pc]++; break;
+        case 0x03: set(31, cur + 8); next_pc = (cur & 0xF0000000u) | ((i & 0x3FFFFFF) << 2); if (trace.enabled) trace.calls[next_pc]++; break;
         case 0x04: branch(A == B, cur, simm); break;
         case 0x05: branch(A != B, cur, simm); break;
         case 0x06: branch((int32_t)A <= 0, cur, simm); break;
@@ -197,7 +240,11 @@ private:
             else halt("unknown COP0 " + hex(i));
             break;
         case 0x12: ++trace.gte_ops;
-            if (rs == 0x00 || rs == 0x02) set(rt, 0);  // MFC2/CFC2 read as 0 for now
+            if (i & 0x02000000u) { if (trace.enabled) trace.gte_cmds[i & 0x1FFFFFFu]++; gte.exec(i & 0x1FFFFFFu); }
+            else if (rs == 0x00) load_to(rt, gte.read(rd_));
+            else if (rs == 0x02) load_to(rt, gte.read_ctl(rd_));
+            else if (rs == 0x04) gte.write(rd_, B);
+            else if (rs == 0x06) gte.write_ctl(rd_, B);
             break;
         case 0x20: { uint32_t v = read(A + simm, 1); load_to(rt, (uint32_t)(int8_t)v); break; }
         case 0x21: { uint32_t v = read(A + simm, 2); load_to(rt, (uint32_t)(int16_t)v); break; }
@@ -223,7 +270,8 @@ private:
             static const uint32_t m[4] = {0, 0xFF, 0xFFFF, 0xFFFFFF};
             static const int s[4] = {0, 8, 16, 24};
             write(a & ~3u, (w & m[a & 3]) | (B << s[a & 3]), 4); break; }
-        case 0x32: case 0x3A: ++trace.gte_ops; break;  // LWC2/SWC2
+        case 0x32: ++trace.gte_ops; gte.write(rt, read(A + simm, 4)); break;     // LWC2
+        case 0x3A: ++trace.gte_ops; write(A + simm, gte.read(rt), 4); break;     // SWC2
         default: ++trace.unknown_ops; halt("unknown opcode " + hex(i)); break;
         }
     }
@@ -243,7 +291,7 @@ private:
     static const char* name(uint32_t table, uint32_t fn) {
         if (table == 0xA0) switch (fn) {
             case 0x13: return "setjmp"; case 0x14: return "longjmp"; case 0x17: return "strcmp";
-            case 0x19: return "strcpy"; case 0x1B: return "strlen"; case 0x25: return "toupper";
+            case 0x15: return "strcat"; case 0x16: return "strncat"; case 0x18: return "strncmp"; case 0x1A: return "strncpy"; case 0x1C: return "index"; case 0x1D: return "rindex"; case 0x1E: return "strchr"; case 0x1F: return "strrchr"; case 0x19: return "strcpy"; case 0x1B: return "strlen"; case 0x25: return "toupper";
             case 0x26: return "tolower"; case 0x27: return "bcopy"; case 0x28: return "bzero";
             case 0x2A: return "memcpy"; case 0x2B: return "memset"; case 0x2C: return "memmove";
             case 0x2D: return "memcmp"; case 0x2F: return "rand"; case 0x30: return "srand";
@@ -262,8 +310,8 @@ private:
             case 0x12: return "InitPad"; case 0x13: return "StartPad"; case 0x14: return "StopPad";
             case 0x15: return "PAD_init"; case 0x16: return "PAD_dr"; case 0x17: return "ReturnFromException";
             case 0x18: return "SetDefaultExitFromException"; case 0x19: return "SetCustomExitFromException";
-            case 0x20: return "UnDeliverEvent"; case 0x32: return "FileOpen"; case 0x3C: return "getchar";
-            case 0x3D: return "putchar"; case 0x56: return "GetC0Table"; case 0x57: return "GetB0Table";
+            case 0x20: return "UnDeliverEvent"; case 0x32: return "FileOpen"; case 0x35: return "write"; case 0x3C: return "getchar";
+            case 0x3D: return "putchar"; case 0x3F: return "puts"; case 0x56: return "GetC0Table"; case 0x57: return "GetB0Table";
             default: return "?";
         }
         switch (fn) {
@@ -283,8 +331,8 @@ private:
     void bios_call(uint32_t table) {
         uint32_t fn = r[9] & 0xFF;
         char key[96];
-        std::snprintf(key, sizeof key, "%02X:%02X %s", table, fn, name(table, fn));
-        trace.bios_calls[key]++;
+        if (trace.enabled) std::snprintf(key, sizeof key, "%02X:%02X %s", table, fn, name(table, fn));
+        if (trace.enabled) trace.bios_calls[key]++;
         uint32_t ret = 0;
         bool handled = true;
         if (table == 0xA0) {
@@ -298,6 +346,20 @@ private:
             case 0x17: { std::string a = cstr(r[4]), b = cstr(r[5]); ret = a < b ? (uint32_t)-1 : (a > b); break; }
             case 0x19: { uint32_t d = r[4], s = r[5]; for (;; ++d, ++s) { uint32_t c = read(s, 1); write(d, c, 1); if (!c) break; } ret = r[4]; break; }
             case 0x1B: ret = (uint32_t)cstr(r[4]).size(); break;
+            case 0x15: case 0x16: {   // strcat / strncat
+                uint32_t d = r[4] + (uint32_t)cstr(r[4]).size(); uint32_t s2 = r[5], n = fn == 0x16 ? r[6] : 0xFFFFFFFFu;
+                for (; n; --n, ++d, ++s2) { uint32_t c = read(s2, 1); write(d, c, 1); if (!c) break; }
+                if (fn == 0x16 && n == 0) write(d, 0, 1);
+                ret = r[4]; break; }
+            case 0x18: { uint32_t n = r[6]; ret = 0;   // strncmp
+                for (uint32_t k = 0; k < n; ++k) { int a = read(r[4] + k, 1), b = read(r[5] + k, 1); if (a != b) { ret = (uint32_t)(a - b); break; } if (!a) break; }
+                break; }
+            case 0x1A: { uint32_t n = r[6], k = 0;     // strncpy
+                for (; k < n; ++k) { uint32_t c = read(r[5] + k, 1); write(r[4] + k, c, 1); if (!c) { ++k; break; } }
+                for (; k < n; ++k) write(r[4] + k, 0, 1);
+                ret = r[4]; break; }
+            case 0x1C: case 0x1E: { ret = 0; for (uint32_t k = 0; k < 4096; ++k) { uint32_t c = read(r[4] + k, 1); if (c == (r[5] & 0xFF)) { ret = r[4] + k; break; } if (!c) break; } break; }  // index / strchr
+            case 0x1D: case 0x1F: { ret = 0; for (uint32_t k = 0; k < 4096; ++k) { uint32_t c = read(r[4] + k, 1); if (c == (r[5] & 0xFF)) ret = r[4] + k; if (!c) break; } break; }  // rindex / strrchr
             case 0x25: { uint32_t c = r[4]; ret = (c >= 'a' && c <= 'z') ? c - 32 : c; break; }
             case 0x26: { uint32_t c = r[4]; ret = (c >= 'A' && c <= 'Z') ? c + 32 : c; break; }
             case 0x27: case 0x2A: case 0x2C: {
@@ -317,12 +379,27 @@ private:
             case 0x33: { uint32_t n = (r[4] + 7) & ~7u; if (heap_ptr && heap_ptr + n <= heap_end) { ret = heap_ptr; heap_ptr += n; } break; }
             case 0x34: break;   // free: leak (bump allocator)
             case 0x3F: { ++trace.printf_calls; hle_printf(); break; }
+            case 0x43: {   // DoExecute(EXEC* e, argc, argv): start the loaded program
+                uint32_t e = r[4], argc = r[5], argv = r[6];
+                uint32_t pc0 = read(e, 4), gp0 = read(e + 4, 4), b_addr = read(e + 0x18, 4), b_size = read(e + 0x1C, 4);
+                uint32_t s_addr = read(e + 0x20, 4), s_size = read(e + 0x24, 4);
+                for (uint32_t k = 0; k < b_size; ++k) write(b_addr + k, 0, 1);
+                if (s_addr) r[29] = r[30] = s_addr + s_size;
+                r[28] = gp0; r[4] = argc; r[5] = argv;
+                frames.clear(); hook_buf = 0; pend = {}; prev = {};
+                cop0[12] = 0x10900000;
+                ++trace.execs; trace.log += "[DoExecute pc=" + hex(pc0) + "]\n";
+                pc = pc0; next_pc = pc + 4;
+                return; }
             case 0x44: case 0x45: break;
             default: handled = false; break;
             }
         } else if (table == 0xB0) {
             switch (fn) {
             case 0x08: ret = ++event_id; break;      // OpenEvent -> fresh handle
+            case 0x3F: if (trace.log.size() < 65536) trace.log += cstr(r[4]) + "\n"; ret = 1; break;   // std_out_puts
+            case 0x35: { uint32_t n = r[6]; if (r[4] == 1 && trace.log.size() < 65536) for (uint32_t k = 0; k < n && k < 512; ++k) trace.log += (char)read(r[5] + k, 1); ret = n; break; }   // write(fd, buf, n): fd 1 = console
+            case 0x3D: trace.log += (char)r[4]; ret = r[4]; break;         // std_out_putchar
             case 0x19: hook_buf = r[4]; ret = 0; break;   // library registers its interrupt entry jmp_buf
             case 0x17: return_from_exception(); return;   // ReturnFromException: no normal return
             case 0x0C: ret = 1; break;               // EnableEvent
@@ -335,14 +412,93 @@ private:
             handled = true;  // C0 table: accept silently (kernel-internal setup)
         }
         if (!handled) {
-            std::snprintf(key, sizeof key, "UNHANDLED %02X:%02X %s a0=%08X a1=%08X ra=%08X", table, fn, name(table, fn), r[4], r[5], r[31]);
-            trace.bios_calls[key]++;
+            if (trace.enabled) { std::snprintf(key, sizeof key, "UNHANDLED %02X:%02X %s a0=%08X a1=%08X ra=%08X", table, fn, name(table, fn), r[4], r[5], r[31]); trace.bios_calls[key]++; }
         }
         set(2, ret);
         pc = r[31]; next_pc = pc + 4;
     }
     uint32_t event_id = 0xF1000000u;
 
+    // ---- SIO0: controller port (digital pad on port 1) ------------------------
+    uint8_t sio_rx = 0xFF; bool sio_rx_ready = false, sio_irq = false; int sio_idx = 0; uint64_t ack_due = 0;
+    void sio_tx(uint8_t v) {
+        bool port2 = (rd(&io[0x4A], 2) & 0x2000) != 0;
+        uint8_t reply = 0xFF; bool more = false;
+        if (!port2) {
+            uint16_t w = (uint16_t)~pad1;   // wire format is active-low
+            switch (sio_idx) {
+            case 0: if (v == 0x01) { reply = 0xFF; more = true; sio_idx = 1; } break;
+            case 1: reply = 0x41; more = true; sio_idx = 2; break;                 // digital pad ID
+            case 2: reply = 0x5A; more = true; sio_idx = 3; break;
+            case 3: reply = (uint8_t)(w & 0xFF); more = true; sio_idx = 4; break;
+            case 4: reply = (uint8_t)(w >> 8); sio_idx = 0; break;
+            }
+        }
+        sio_rx = reply; sio_rx_ready = true;
+        if (more) ack_due = icount + 300;
+    }
+
+    // ---- DMA -----------------------------------------------------------------
+    uint32_t ioreg(uint32_t a) { return rd(&io[a - 0x1F801000], 4); }
+    void irq_set(int bit) { wr(&io[0x70], rd(&io[0x70], 4) | (1u << bit), 4); }
+    void dicr_update() {
+        uint32_t d = ioreg(0x1F8010F4);
+        bool master = (d & (1u << 15)) || ((d & (1u << 23)) && (((d >> 16) & 0x7F) & ((d >> 24) & 0x7F)));
+        bool was = d & 0x80000000u;
+        d = master ? (d | 0x80000000u) : (d & ~0x80000000u);
+        wr(&io[0xF4], d, 4);
+        if (master && !was) irq_set(3);
+    }
+    void dma_done(uint32_t ch) {
+        uint32_t chcr = 0x1F801088 + ch * 0x10;
+        wr(&io[chcr - 0x1F801000], ioreg(chcr) & ~0x11000000u, 4);
+        uint32_t d = ioreg(0x1F8010F4);
+        if (d & (1u << (16 + ch))) { d |= 1u << (24 + ch); wr(&io[0xF4], d, 4); }
+        dicr_update();
+    }
+    void dma_run(uint32_t ch) {
+        uint32_t base = 0x1F801080 + ch * 0x10;
+        uint32_t madr = ioreg(base) & 0x00FFFFFC, bcr = ioreg(base + 4), chcr = ioreg(base + 8);
+        uint32_t blk = bcr & 0xFFFF, cnt = bcr >> 16;
+        uint32_t words = ((chcr >> 9) & 3) == 1 ? blk * (cnt ? cnt : 1) : (blk ? blk : 0x10000);
+        switch (ch) {
+        case 2: {   // GPU
+            uint32_t sync = (chcr >> 9) & 3;
+            if (chcr & 1) {   // RAM -> GPU
+                if (sync == 2) {   // linked list (ordering table)
+                    uint32_t addr = madr; int guard = 0;
+                    while (guard++ < 1000000) {
+                        uint32_t hdr = read(addr, 4), n = hdr >> 24;
+                        for (uint32_t k = 1; k <= n; ++k) gpu.gp0(read(addr + 4 * k, 4));
+                        uint32_t next = hdr & 0x00FFFFFF;
+                        if (next == 0x00FFFFFF || (next & 0x800000)) break;
+                        addr = next;
+                    }
+                } else for (uint32_t i = 0; i < words; ++i) gpu.gp0(read(madr + 4 * i, 4));
+            } else for (uint32_t i = 0; i < words; ++i) write(madr + 4 * i, gpu.read_gpuread(), 4);   // GPU -> RAM
+            break; }
+        case 3:   // CD-ROM -> RAM
+            if (cd.dbg_log.size() < 60) { char b[64]; std::snprintf(b, sizeof b, "dma3 words=%u madr=%08X", words, madr); cd.dbg_log.push_back(b); }
+            for (uint32_t i = 0; i < words; ++i) write(madr + 4 * i, cd.data_word(), 4);
+            break;
+        case 4:   // RAM -> SPU RAM
+            if (chcr & 1) {
+                uint32_t sa = (rd(&io[0xDA6], 2) * 8) & 0x7FFFF;
+                for (uint32_t i = 0; i < words * 4; ++i) { spu_ram[(sa + i) & 0x7FFFF] = (uint8_t)read(madr + i, 1); }
+            }
+            break;
+        case 6: {  // ordering-table clear
+            uint32_t n = blk ? blk : 0x10000;
+            for (uint32_t i = 0; i < n; ++i) {
+                uint32_t addr = madr - 4 * i;
+                write(addr, i == n - 1 ? 0x00FFFFFFu : ((addr - 4) & 0x00FFFFFFu), 4);
+            }
+            break; }
+        default: ++trace.dma_other; break;
+        }
+        if (trace.enabled) ++trace.dma_runs[ch];
+        dma_done(ch);
+    }
     // ---- interrupts (HLE of the BIOS exception handler) ----------------------
     // The game library registers an "interrupt entry" jmp_buf (B0:19). On an IRQ
     // we save the interrupted context, switch to that buffer's regs/pc, and the

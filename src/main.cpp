@@ -1,13 +1,15 @@
-// Native host for the Vib-Ribbon recompilation.
+// Vib-Ribbon native host: drop (or pass on the command line) vibribbon.cue and it boots.
 //
-// STATUS: the platform shell works (window, Xbox 360 / any SDL-supported
-// gamepad, keyboard fallback). The game code itself is not recompiled yet --
-// see README.md "Roadmap". `game_frame()` is where recompiled game code will
-// be driven once it exists.
+// The game's own code runs on a MIPS interpreter (src/cpu.h) with the PS1 GPU, GTE,
+// CD-ROM, DMA and interrupts emulated. Sound is NOT emulated yet.
 #include <SDL.h>
 
 #include <cstdio>
+#include <memory>
+#include <string>
+#include <vector>
 
+#include "cpu.h"
 #include "disc.h"
 #include "pad_map.h"
 
@@ -20,10 +22,7 @@ void open_first_controller() {
     for (int i = 0; i < SDL_NumJoysticks(); ++i) {
         if (SDL_IsGameController(i)) {
             g_pad = SDL_GameControllerOpen(i);
-            if (g_pad) {
-                std::printf("Controller: %s\n", SDL_GameControllerName(g_pad));
-                return;
-            }
+            if (g_pad) { std::printf("Controller: %s\n", SDL_GameControllerName(g_pad)); return; }
         }
     }
 }
@@ -68,62 +67,75 @@ uint16_t read_keyboard() {
     return w;
 }
 
-// Loads a dropped .cue. Returns a status line for the window title and sets
-// `ok` when it is a recognisable Vib-Ribbon disc. The game itself cannot run
-// yet, so "loaded" means: disc parsed and the boot executables read into memory.
-std::string load_dropped_disc(const std::string& cue, bool& ok) {
-    ok = false;
-    disc::Image img;
-    std::string err = img.open(cue);
-    if (!err.empty()) return "Error: " + err;
-    std::string boot = disc::boot_file(img);
-    std::vector<uint8_t> f;
-    disc::PsxExe loader, title;
-    if (boot.empty() || !img.read_file(boot, f) || !disc::parse_psx_exe(f, loader))
-        return "Error: no bootable PS1 executable on disc";
-    if (boot != "SCES_028.73" || !img.read_file("MAIN_T.EXE", f) || !disc::parse_psx_exe(f, title))
-        return "Loaded disc " + boot + " (not the Vib-Ribbon EU release)";
-    ok = true;
-    return "Vib-Ribbon (EU) disc OK - boot " + boot + ", MAIN_T.EXE ready. Game execution not implemented yet.";
-}
+// One running game. The disc image must outlive the CPU that reads from it.
+struct Emulator {
+    std::unique_ptr<disc::Image> img;
+    std::unique_ptr<cpu::Cpu> cpu;
+};
 
-// Placeholder for the recompiled game. Returns the pad word (active-low, as
-// the PS1 library would see it) for port 1 so the HLE pad layer can be wired
-// in later.
-uint16_t game_frame(uint16_t pad_active_low) {
-    (void)pad_active_low;
-    return pad_active_low;
+// Returns an empty string on success, otherwise a message for the window title.
+std::string boot_disc(const std::string& cue, Emulator& emu) {
+    auto img = std::make_unique<disc::Image>();
+    std::string err = img->open(cue);
+    if (!err.empty()) return "Error: " + err;
+    std::string boot = disc::boot_file(*img);
+    std::vector<uint8_t> f;
+    disc::PsxExe exe;
+    if (boot.empty() || !img->read_file(boot, f) || !disc::parse_psx_exe(f, exe))
+        return "Error: no bootable PS1 executable on disc";
+    if (boot != "SCES_028.73")
+        return "This is " + boot + ", not the Vib-Ribbon EU disc (SCES_028.73); not supported";
+    auto cpu = std::make_unique<cpu::Cpu>();
+    cpu->trace.enabled = false;   // statistics are for the headless tools; they cost a lot of speed
+    cpu->attach_disc(img.get());
+    cpu->load_exe(exe.text, exe.load_addr, exe.pc, exe.gp, exe.sp);
+    emu.cpu.reset();
+    emu.img = std::move(img);
+    emu.cpu = std::move(cpu);
+    return "";
 }
 
 }  // namespace
 
-int main(int, char**) {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO) != 0) {
+int main(int argc, char** argv) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
-    SDL_Window* win = SDL_CreateWindow("Vib-Ribbon (native, WIP)", SDL_WINDOWPOS_CENTERED,
-                                       SDL_WINDOWPOS_CENTERED, 640, 480, SDL_WINDOW_RESIZABLE);
-    SDL_Renderer* ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_PRESENTVSYNC) : nullptr;
+    SDL_Window* win = SDL_CreateWindow("Vib-Ribbon - drop vibribbon.cue here", SDL_WINDOWPOS_CENTERED,
+                                       SDL_WINDOWPOS_CENTERED, 960, 720, SDL_WINDOW_RESIZABLE);
+    SDL_Renderer* ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED) : nullptr;
     if (!win || !ren) {
         std::fprintf(stderr, "Window/renderer failed: %s\n", SDL_GetError());
         return 1;
     }
-    SDL_RenderSetLogicalSize(ren, 640, 480);  // keep 4:3 when resized
+    SDL_RenderSetLogicalSize(ren, 640, 480);   // always shown 4:3, like a TV
+    SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
     open_first_controller();
 
-    uint16_t last = 0xFFFF;
-    int disc_state = 0;  // 0 none, 1 recognised Vib-Ribbon disc, 2 error / other disc
+    Emulator emu;
+    SDL_Texture* tex = nullptr;
+    int tex_w = 0, tex_h = 0;
+    std::vector<uint32_t> pixels;
+    bool fullscreen = false;
+    uint32_t frames = 0, last_title = SDL_GetTicks();
+
+    auto start = [&](const std::string& cue) {
+        std::string msg = boot_disc(cue, emu);
+        if (!msg.empty()) { SDL_SetWindowTitle(win, msg.c_str()); std::printf("%s\n", msg.c_str()); }
+        else SDL_SetWindowTitle(win, "Vib-Ribbon");
+    };
+    if (argc > 1) start(argv[1]);
+
     for (bool running = true; running;) {
+        uint32_t frame_start = SDL_GetTicks();
         for (SDL_Event e; SDL_PollEvent(&e);) {
             if (e.type == SDL_QUIT) running = false;
-            if (e.type == SDL_DROPFILE) {
-                bool ok;
-                std::string msg = load_dropped_disc(e.drop.file, ok);
-                SDL_SetWindowTitle(win, msg.c_str());
-                std::printf("%s\n", msg.c_str());
-                disc_state = ok ? 1 : 2;
-                SDL_free(e.drop.file);
+            if (e.type == SDL_DROPFILE) { start(e.drop.file); SDL_free(e.drop.file); }
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F11) {
+                fullscreen = !fullscreen;
+                SDL_SetWindowFullscreen(win, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
             }
             if (e.type == SDL_CONTROLLERDEVICEADDED) open_first_controller();
             if (e.type == SDL_CONTROLLERDEVICEREMOVED && g_pad &&
@@ -133,18 +145,44 @@ int main(int, char**) {
                 open_first_controller();
             }
         }
-        uint16_t pressed = pad::to_ps1(read_controller()) | read_keyboard();
-        uint16_t wire = game_frame(pad::to_wire(pressed));
-        if (wire != last) {
-            std::printf("pad word (active-low): 0x%04X\n", wire);
-            last = wire;
-        }
-        if (disc_state == 1) SDL_SetRenderDrawColor(ren, 0, 40, 0, 255);
-        else if (disc_state == 2) SDL_SetRenderDrawColor(ren, 50, 0, 0, 255);
-        else SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
         SDL_RenderClear(ren);
+        if (emu.cpu) {
+            emu.cpu->pad1 = pad::to_ps1(read_controller()) | read_keyboard();
+            if (!emu.cpu->run_frame() && emu.cpu->halted) {
+                std::string m = "CPU stopped: " + emu.cpu->halt_reason;
+                SDL_SetWindowTitle(win, m.c_str());
+                std::fprintf(stderr, "%s\n", m.c_str());
+                emu.cpu.reset();   // back to waiting for a disc
+            } else {
+                int w = 0, h = 0;
+                emu.cpu->gpu.display(pixels, w, h);
+                if (!tex || w != tex_w || h != tex_h) {
+                    if (tex) SDL_DestroyTexture(tex);
+                    tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+                    tex_w = w; tex_h = h;
+                }
+                SDL_UpdateTexture(tex, nullptr, pixels.data(), w * 4);
+                SDL_RenderCopy(ren, tex, nullptr, nullptr);
+                ++frames;
+            }
+        }
         SDL_RenderPresent(ren);
+
+        uint32_t now = SDL_GetTicks();
+        if (emu.cpu && now - last_title >= 1000) {   // FPS in the title bar
+            char t[96];
+            std::snprintf(t, sizeof t, "Vib-Ribbon - %u fps (target 50)", frames);
+            SDL_SetWindowTitle(win, t);
+            frames = 0; last_title = now;
+        }
+        // Hold the PAL 50 Hz pace; if emulation is slower than that we simply run flat out.
+        uint32_t spent = SDL_GetTicks() - frame_start;
+        if (emu.cpu && spent < 20) SDL_Delay(20 - spent);
+        else if (!emu.cpu) SDL_Delay(16);
     }
+    if (tex) SDL_DestroyTexture(tex);
     if (g_pad) SDL_GameControllerClose(g_pad);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);

@@ -32,6 +32,14 @@ public:
         std::string bin = t.substr(q1 + 1, q2 - q1 - 1);
         size_t slash = cue_path.find_last_of("/\\");
         std::string dir = slash == std::string::npos ? "" : cue_path.substr(0, slash + 1);
+        {   // INDEX 01 of every track, in frames from the start of the bin
+            size_t p = 0; tracks_.clear();
+            while ((p = t.find("INDEX 01 ", p)) != std::string::npos) {
+                p += 9; int mm = 0, ss = 0, ff = 0;
+                std::sscanf(t.c_str() + p, "%d:%d:%d", &mm, &ss, &ff);
+                tracks_.push_back((uint32_t)((mm * 60 + ss) * 75 + ff));
+            }
+        }
         bin_.open(dir + bin, std::ios::binary);
         if (!bin_) return "Cannot open " + dir + bin;
         if (t.find("MODE2/2352") != std::string::npos) { ss_ = 2352; off_ = 24; }
@@ -48,6 +56,19 @@ public:
 
     const std::vector<Entry>& entries() const { return entries_; }
 
+    // Raw sector (as stored in the .bin). Returns false past the end of the image.
+    bool raw_sector(uint32_t lba, uint8_t* out, uint32_t* size) {
+        bin_.clear();
+        bin_.seekg((std::streamoff)lba * ss_);
+        bin_.read((char*)out, ss_);
+        *size = ss_;
+        return bin_.gcount() == (std::streamsize)ss_;
+    }
+    uint32_t data_offset() const { return off_; }
+    uint32_t sector_size() const { return ss_; }
+    uint32_t total_sectors() { bin_.clear(); bin_.seekg(0, std::ios::end); return (uint32_t)((uint64_t)bin_.tellg() / ss_); }
+    const std::vector<uint32_t>& track_starts() const { return tracks_; }  // frames, index 01 per track (from cue)
+
     bool read_file(const std::string& name, std::vector<uint8_t>& out) {
         std::string want = upper(name);
         for (auto& e : entries_)
@@ -59,6 +80,7 @@ private:
     std::ifstream bin_;
     uint32_t ss_ = 2352, off_ = 24;
     std::vector<Entry> entries_;
+    std::vector<uint32_t> tracks_;
 
     static uint32_t u32(const std::vector<uint8_t>& d, size_t i) {
         return d[i] | d[i + 1] << 8 | d[i + 2] << 16 | (uint32_t)d[i + 3] << 24;

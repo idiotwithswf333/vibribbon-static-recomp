@@ -1,27 +1,21 @@
-# Vib-Ribbon native (static recompilation WIP)
+# Vib-Ribbon native (PS1, European disc `SCES-028.73`)
 
-A work-in-progress effort to run Vib-Ribbon (PS1, European release, `SCES_028.73`)
-natively on PC, built from your own disc image. **No game data is included or
-should ever be committed.** You supply your own legally obtained disc.
+Runs Vib-Ribbon on Windows from **your own disc image**. No game data is included
+and none should ever be committed (`assets/`, `*.bin`, `*.cue` are gitignored).
 
-## Status (read this first)
+The game's original code runs on a MIPS R3000 interpreter. The PS1 hardware it
+talks to (GPU, GTE, CD-ROM, DMA, timers, interrupts, controller port) is emulated
+in this repo, and the picture is drawn by a software rasterizer.
 
-| Piece | State |
-|---|---|
-| Disc extraction (`tools/extract_disc.py`) | Works, tested on the EU BIN/CUE |
-| Windows build + CI (`.github/workflows/build.yml`) | Written, not yet run on GitHub |
-| SDL2 window + gamepad layer | Written, not yet compiled with SDL |
-| Xbox 360 -> PS1 pad mapping (`src/pad_map.h`) | Done, unit tested |
-| splat configs (`config/`) | Untested starting points |
-| MIPS R3000 interpreter + BIOS/syscall/interrupt HLE (`src/cpu.h`) | Works, unit tested (`tests/cpu_test.cpp`) |
-| Boot loader (`SCES_028.73`) on the interpreter | Runs: prints "Loader main()", handles vblank IRQs, then waits for the CD-ROM |
-| CD-ROM controller, GPU, SPU, GTE | **Not started** (next: CD-ROM, so the loader can load `MAIN_T.EXE`) |
-| Native recompilation of game code | Not started (interpreter-first approach; recompile later for speed) |
-| GPU / SPU / CD / pad HLE | **Not started** |
+## Use it
 
-Right now `vibribbon.exe` opens a window, reads your controller, and recognises
-the disc you drop on it. It does not run the game yet. The CPU core can already
-boot the game's loader headlessly: `boot_trace vibribbon.cue SCES_028.73`.
+1. Push this repo to GitHub. The **build** workflow runs automatically and
+   publishes a `vibribbon-windows` artifact (Actions tab -> latest run).
+   Push a tag like `v0.1` to also get a downloadable Release.
+2. Unzip, run `vibribbon.exe`, and **drag `vibribbon.cue` onto the window**
+   (or drag the .cue onto the .exe). The title screen comes up in a few seconds.
+
+Keys: Esc quits, F11 toggles fullscreen.
 
 ## Controls
 
@@ -37,23 +31,27 @@ Xbox 360 controller (any SDL-supported pad works):
 
 Keyboard fallback: arrows, Z=Cross, X=Circle, A=Square, S=Triangle, Enter=Start, Right Shift=Select.
 
-## Build
+## Status (honest)
 
-Push to GitHub and the **build** workflow produces a `vibribbon-windows`
-artifact. Locally: `cmake -S . -B build && cmake --build build --config Release`.
+| Piece | State |
+|---|---|
+| Loader boots, reads the disc, starts the title (`MAIN_T.EXE`) | Works (tested headlessly on the EU disc) |
+| Title screen: animated vector logo, language menu, copyright line | Renders correctly (checked via screenshots) |
+| Speed | ~60 fps headless in the dev sandbox (target 50); Windows speed not yet measured |
+| `MAIN_G.EXE` (the actual game), `MAIN_K.EXE` (kiosk) | Not tested yet |
+| Sound / CD audio tracks | **Not implemented** (silent) |
+| Controller | Controller port is emulated, but the title code never reads it, so button input is **unverified** |
+| Windows build (`src/main.cpp`, CMake, CI) | Written and type-checked, **never compiled with real SDL** -- first CI run may need a small fix |
+| Gouraud/dither/exact fill rules, semi-transparency edge cases | Approximate |
 
-## Using your disc
+## Layout
 
-    python tools/extract_disc.py path/to/vibribbon.cue
-
-This writes `assets/disc/` (gitignored) plus `manifest.json` with SHA-1s.
-Executables: `SCES_028.73` (loader, loads at 0x80010000), `MAIN_G.EXE` (game,
-0x80019000), `MAIN_T.EXE` (title), `MAIN_K.EXE` (kiosk).
-
-## Roadmap
-
-1. Run splat on the loader and `MAIN_G.EXE`; get a byte-identical rebuild from asm.
-2. Identify compiler/PsyQ versions (the game is C++; sources like `VideoSys.cpp`
-   are named in its strings).
-3. Reimplement the Sony library calls (GPU, SPU, CD, pad, timers) over SDL2.
-4. Recompile or decompile game code to run against that layer.
+- `src/cpu.h` - R3000 interpreter, memory map, high-level BIOS (BIOS ROM is not needed)
+- `src/gpu.h`, `src/gte.h`, `src/cdrom.h`, `src/disc.h` - hardware and disc reading
+- `src/main.cpp` - SDL window, drag-and-drop, controller
+- `tests/` - unit tests (`cpu_test`, `pad_map_test`, run in CI) and headless tools that need your disc:
+  - `disc_info game.cue` - list the disc's boot files
+  - `boot_trace game.cue [EXE] [max_instr] [out.ppm]` - run and report BIOS calls, hardware access, GPU commands; optional screenshot
+  - `title_shot game.cue prefix` - boot to the title, press some buttons, save PPM screenshots
+- `tools/extract_disc.py` - extract the files from a BIN/CUE
+- `config/` - early splat configs from the decompilation approach (not used by the build)

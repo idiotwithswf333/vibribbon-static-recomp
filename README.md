@@ -39,7 +39,7 @@ Keyboard fallback: arrows, Z=Cross, X=Circle, A=Square, S=Triangle, Enter=Start,
 | Title screen: animated vector logo, language menu, copyright line | Renders correctly (checked via screenshots) |
 | Speed | ~60 fps headless in the dev sandbox (target 50); Windows speed not yet measured |
 | `MAIN_G.EXE` (the actual game), `MAIN_K.EXE` (kiosk) | Not tested yet |
-| Sound / CD audio tracks | **Not implemented** (silent) |
+| Sound (SPU: 24 ADPCM voices, ADSR) and CD-DA audio tracks | Implemented; title-screen sound verified headlessly, CD-DA verified against the disc's audio tracks. Not implemented: reverb, noise, pitch modulation, volume sweeps |
 | Controller | Controller port is emulated, but the title code never reads it, so button input is **unverified** |
 | Windows build (`src/main.cpp`, CMake, CI) | Written and type-checked, **never compiled with real SDL** -- first CI run may need a small fix |
 | Gouraud/dither/exact fill rules, semi-transparency edge cases | Approximate |

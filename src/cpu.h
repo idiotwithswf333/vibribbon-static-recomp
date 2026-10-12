@@ -16,6 +16,7 @@
 #include "disc.h"
 #include "gpu.h"
 #include "gte.h"
+#include "spu.h"
 
 namespace cpu {
 
@@ -44,7 +45,7 @@ public:
     hw::CdRom cd;
     hw::Gpu gpu;
     hw::Gte gte;
-    std::vector<uint8_t> spu_ram = std::vector<uint8_t>(512 * 1024);
+    hw::Spu spu;
     void attach_disc(disc::Image* d) { cd.img = d; }
 
     // ---- memory ---------------------------------------------------------
@@ -101,6 +102,12 @@ public:
         if (icount % 677376 == 0) { uint32_t st = rd(&io[0x70], 4) | 1u; wr(&io[0x70], st, 4); ++vblanks; }  // PAL 50 Hz
     }
     uint64_t vblanks = 0, irqs_taken = 0;
+    // n stereo frames (interleaved int16) of everything audible: SPU voices + CD audio.
+    void audio_frame(int n, int16_t* out) {
+        cd_buf_.resize((size_t)n * 2);
+        cd.audio_samples(n, cd_buf_.data());
+        spu.mix(n, out, cd_buf_.data());
+    }
     uint16_t pad1 = 0;   // controller 1, ACTIVE-HIGH (see pad_map.h); set by the frontend
     // Runs until the next vblank has occurred (or max instructions). Returns false if halted.
     bool run_frame(uint64_t max_instr = 2000000) {
@@ -131,7 +138,7 @@ private:
         if (a == 0x1F801044) return 0x5u | (sio_rx_ready ? 2u : 0u) | (sio_irq ? 0x200u : 0u) | 0x80u * (!sio_irq);
         if (a == 0x1F801814) return gpu.stat();
         if (a >= 0x1F801800 && a <= 0x1F801803) return cd.read8(a - 0x1F801800);
-        if (a == 0x1F801DAE) return rd(&io[0xDAA], 2) & 0x3F;   // SPUSTAT mirrors SPUCNT's low bits
+        if (a >= 0x1F801C00 && a < 0x1F801E00) return spu.read(a - 0x1F801C00, size);
         if (a == 0x1F801810) return gpu.read_gpuread();
         // Root counters: current values derived from elapsed instructions (~1 cycle each).
         if (a == 0x1F801100) return (uint32_t)((icount / 6) & 0xFFFF);      // dot clock
@@ -151,6 +158,7 @@ private:
             if (!(v & 2)) { sio_idx = 0; ack_due = 0; }                                       // DTR low: deselect
             return;
         }
+        if (a >= 0x1F801C00 && a < 0x1F801E00) { spu.write(a - 0x1F801C00, v, size); return; }
         if (a == 0x1F801810) { gpu.gp0(v); return; }
         if (a == 0x1F801814) { gpu.gp1(v); return; }
         if (a == 0x1F801070) { wr(&io[off], rd(&io[off], 4) & v, 4); return; }  // I_STAT: write-0-to-ack
@@ -418,6 +426,7 @@ private:
         pc = r[31]; next_pc = pc + 4;
     }
     uint32_t event_id = 0xF1000000u;
+    std::vector<int16_t> cd_buf_;
 
     // ---- SIO0: controller port (digital pad on port 1) ------------------------
     uint8_t sio_rx = 0xFF; bool sio_rx_ready = false, sio_irq = false; int sio_idx = 0; uint64_t ack_due = 0;
@@ -482,10 +491,7 @@ private:
             for (uint32_t i = 0; i < words; ++i) write(madr + 4 * i, cd.data_word(), 4);
             break;
         case 4:   // RAM -> SPU RAM
-            if (chcr & 1) {
-                uint32_t sa = (rd(&io[0xDA6], 2) * 8) & 0x7FFFF;
-                for (uint32_t i = 0; i < words * 4; ++i) { spu_ram[(sa + i) & 0x7FFFF] = (uint8_t)read(madr + i, 1); }
-            }
+            if (chcr & 1) for (uint32_t i = 0; i < words; ++i) spu.dma_write_word(read(madr + 4 * i, 4));
             break;
         case 6: {  // ordering-table clear
             uint32_t n = blk ? blk : 0x10000;

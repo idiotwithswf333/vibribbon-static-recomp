@@ -18,7 +18,8 @@ public:
     std::vector<uint8_t> data_buf;        // current sector payload
     size_t data_pos = 0;
     bool drq = false;
-    uint64_t cmds = 0, sectors_read = 0;
+    uint64_t cmds = 0, sectors_read = 0, play_cmds = 0;
+    bool playing = false, muted = false;
     uint32_t dbg_loc() const { return loc; }
     uint8_t dbg_mode() const { return mode; }
     std::vector<std::string> dbg_log;   // first commands, for diagnostics
@@ -45,9 +46,33 @@ public:
             if (reg == 1) command(v);
             else if (reg == 2) params.push_back(v);
             else { if ((v & 0x80) && !drq) data_pos = 0; drq = (v & 0x80) != 0; if (dbg_log.size() < 60) { char b[64]; std::snprintf(b, sizeof b, "req=%02X pos=%zu size=%zu", v, data_pos, data_buf.size()); dbg_log.push_back(b); } }
+        } else if (index == 2) {
+            if (reg == 2) cdvol[0] = v; else if (reg == 3) cdvol[1] = v;     // L->L, L->R
+        } else if (index == 3) {
+            if (reg == 1) cdvol[3] = v; else if (reg == 2) cdvol[2] = v;     // R->R, R->L
         } else if (index == 1) {
             if (reg == 2) ier = v & 0x1F;
             else if (reg == 3) { ifr &= ~(v & 0x1F); if (v & 0x40) params.clear(); }
+        }
+    }
+    // CD-DA: n stereo frames of 44.1 kHz audio (interleaved), after the CD volume matrix.
+    void audio_samples(int n, int16_t* out) {
+        for (int i = 0; i < n; ++i) {
+            int l = 0, r = 0;
+            if (playing && !muted) {
+                if (!da_loaded) {
+                    uint32_t sz = 0; da_sec.assign(2352, 0);
+                    if (!img || !img->raw_sector(da_lba, da_sec.data(), &sz) || sz != 2352) { playing = false; }
+                    da_loaded = true; da_off = 0;
+                }
+                if (playing) {
+                    const uint8_t* p = &da_sec[da_off * 4];
+                    int L = (int16_t)(p[0] | p[1] << 8), R = (int16_t)(p[2] | p[3] << 8);
+                    l = (L * cdvol[0] + R * cdvol[2]) >> 7; r = (R * cdvol[3] + L * cdvol[1]) >> 7;
+                    if (++da_off >= 588) { da_off = 0; ++da_lba; da_loaded = false; }
+                }
+            }
+            out[2 * i] = (int16_t)std::clamp(l, -32768, 32767); out[2 * i + 1] = (int16_t)std::clamp(r, -32768, 32767);
         }
     }
     uint8_t data_byte() { return data_pos < data_buf.size() ? data_buf[data_pos++] : 0; }
@@ -77,10 +102,12 @@ private:
     uint64_t now_ = 0, busy_until = 0;
     uint32_t loc = 0;           // next sector index in the .bin (MSF - 150)
     bool reading = false;
+    std::vector<uint8_t> da_sec; int da_off = 0; bool da_loaded = false; uint32_t da_lba = 0;
+    int cdvol[4] = {0x80, 0, 0, 0x80};   // BIOS default: L->L, L->R, R->L, R->R
 
     static constexpr uint64_t kFirst = 15000, kSecond = 30000, kSector = 30000;
 
-    uint8_t stat() const { return 0x02; }
+    uint8_t stat() const { return playing ? 0x82 : 0x02; }
     uint8_t stat_reading() const { return 0x22; }
     static uint8_t bcd(unsigned v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
     static unsigned unbcd(uint8_t b) { return (b >> 4) * 10 + (b & 15); }
@@ -125,12 +152,28 @@ private:
             { Ev e{t + kSector, 1, {}}; e.sector = true;
               auto it = q.begin(); while (it != q.end() && it->t <= e.t) ++it; q.insert(it, std::move(e)); }
             break;
-        case 0x09: reading = false; q.erase(std::remove_if(q.begin(), q.end(), [](const Ev& e){ return e.sector; }), q.end());
+        case 0x09: playing = false; reading = false; q.erase(std::remove_if(q.begin(), q.end(), [](const Ev& e){ return e.sector; }), q.end());
                    push(t, 3, {stat_reading()}); push(t + kSecond, 2, {stat()}); break;   // Pause
-        case 0x08: reading = false; push(t, 3, {stat()}); push(t + kSecond, 2, {0x00}); break;  // Stop
-        case 0x0A: mode = 0x20; reading = false; push(t, 3, {stat()}); push(t + kSecond, 2, {stat()}); break;  // Init
+        case 0x08: playing = false; reading = false; push(t, 3, {stat()}); push(t + kSecond, 2, {0x00}); break;  // Stop
+        case 0x0A: mode = 0x20; playing = false; reading = false; push(t, 3, {stat()}); push(t + kSecond, 2, {stat()}); break;  // Init
         case 0x07: push(t, 3, {stat()}); push(t + kSecond, 2, {stat()}); break;  // MotorOn
-        case 0x0B: case 0x0C: case 0x0D: push(t, 3, {stat()}); break;            // Mute / Demute / Setfilter
+        case 0x0B: muted = true; push(t, 3, {stat()}); break;                  // Mute
+        case 0x0C: muted = false; push(t, 3, {stat()}); break;                 // Demute
+        case 0x0D: push(t, 3, {stat()}); break;                                // Setfilter
+        case 0x03: {                                                           // Play (CD-DA)
+            ++play_cmds;
+            unsigned tr = p.empty() ? 0 : unbcd(p[0]);
+            if (img && tr >= 1 && tr <= img->track_starts().size()) da_lba = img->track_starts()[tr - 1]; else da_lba = loc;
+            da_off = 0; da_loaded = false; playing = true; reading = false;
+            q.erase(std::remove_if(q.begin(), q.end(), [](const Ev& e){ return e.sector; }), q.end());
+            push(t, 3, {stat()}); break; }
+        case 0x11: {                                                           // GetlocP
+            uint32_t lba = playing ? da_lba : loc, tr = 1;
+            if (img) { auto& ts = img->track_starts(); for (size_t k = 0; k < ts.size(); ++k) if (ts[k] <= lba) tr = (uint32_t)k + 1; }
+            uint32_t base = (img && tr >= 1 && tr <= img->track_starts().size()) ? img->track_starts()[tr - 1] : 0;
+            uint32_t rel = lba >= base ? lba - base : 0, ab = lba + 150;
+            push(t, 3, {bcd(tr), 0x01, bcd(rel / 75 / 60), bcd(rel / 75 % 60), bcd(rel % 75), bcd(ab / 75 / 60), bcd(ab / 75 % 60), bcd(ab % 75)});
+            break; }
         case 0x0E: if (!p.empty()) mode = p[0]; push(t, 3, {stat()}); break;     // Setmode
         case 0x13: push(t, 3, {stat(), 0x01, bcd((unsigned)(img ? std::max<size_t>(1, img->track_starts().size()) : 1))}); break;  // GetTN
         case 0x14: {                                                              // GetTD

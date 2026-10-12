@@ -1,7 +1,7 @@
 // Vib-Ribbon native host: drop (or pass on the command line) vibribbon.cue and it boots.
 //
 // The game's own code runs on a MIPS interpreter (src/cpu.h) with the PS1 GPU, GTE,
-// CD-ROM, DMA and interrupts emulated. Sound is NOT emulated yet.
+// CD-ROM, SPU (24 ADPCM voices + ADSR), CD-DA audio, DMA and interrupts emulated.
 #include <SDL.h>
 
 #include <cstdio>
@@ -98,7 +98,7 @@ std::string boot_disc(const std::string& cue, Emulator& emu) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
@@ -112,6 +112,15 @@ int main(int argc, char** argv) {
     SDL_RenderSetLogicalSize(ren, 640, 480);   // always shown 4:3, like a TV
     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
     open_first_controller();
+
+    // Audio: 44.1 kHz stereo, fed one video frame (882 sample frames at 50 Hz) at a time.
+    SDL_AudioSpec want{}, have{};
+    want.freq = 44100; want.format = AUDIO_S16SYS; want.channels = 2; want.samples = 1024;
+    SDL_AudioDeviceID audio = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+    if (audio) SDL_PauseAudioDevice(audio, 0);
+    else std::fprintf(stderr, "Audio unavailable: %s\n", SDL_GetError());
+    constexpr int kAudioFrames = 44100 / 50;
+    std::vector<int16_t> audio_buf((size_t)kAudioFrames * 2);
 
     Emulator emu;
     SDL_Texture* tex = nullptr;
@@ -155,7 +164,15 @@ int main(int argc, char** argv) {
                 SDL_SetWindowTitle(win, m.c_str());
                 std::fprintf(stderr, "%s\n", m.c_str());
                 emu.cpu.reset();   // back to waiting for a disc
+                if (audio) SDL_ClearQueuedAudio(audio);
             } else {
+                if (audio) {
+                    // Keep the queue shallow (~100 ms) so sound stays in sync with the picture.
+                    if (SDL_GetQueuedAudioSize(audio) < (Uint32)kAudioFrames * 4 * 5) {
+                        emu.cpu->audio_frame(kAudioFrames, audio_buf.data());
+                        SDL_QueueAudio(audio, audio_buf.data(), (Uint32)audio_buf.size() * 2);
+                    } else emu.cpu->audio_frame(kAudioFrames, audio_buf.data());   // still advance the SPU
+                }
                 int w = 0, h = 0;
                 emu.cpu->gpu.display(pixels, w, h);
                 if (!tex || w != tex_w || h != tex_h) {
@@ -184,6 +201,7 @@ int main(int argc, char** argv) {
     }
     if (tex) SDL_DestroyTexture(tex);
     if (g_pad) SDL_GameControllerClose(g_pad);
+    if (audio) SDL_CloseAudioDevice(audio);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();

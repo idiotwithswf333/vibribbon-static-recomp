@@ -40,7 +40,10 @@ Keyboard: arrows or WASD = D-pad, Z/Space = Cross, X = Circle, C = Square, V = T
 | Speed | ~60 fps headless in the dev sandbox (target 50); Windows speed not yet measured |
 | `MAIN_G.EXE` (the actual game), `MAIN_K.EXE` (kiosk) | Not tested yet |
 | Sound (SPU: 24 ADPCM voices, ADSR) and CD-DA audio tracks | Implemented; title-screen sound verified headlessly, CD-DA verified against the disc's audio tracks. Not implemented: reverb, noise, pitch modulation, volume sweeps |
-| Controller | Controller port is emulated, but the title code never reads it, so button input is **unverified** |
+| Real BIOS boot (work in progress) | `Cpu::load_bios()` + `Cpu::sideload_exe()` boot a real BIOS ROM to the shell (0x80030000), then side-load the disc's boot EXE under the real kernel. **Not yet wired into `main.cpp`.** Headless demos: `tests/bios_boot.cpp`, `tests/bios_title.cpp bios.bin game.cue out_prefix [frames]`. With it the title reads the pad and the language menu responds to input |
+| CD timing | Sector rate slowed to 90000 cycles/sector so the real kernel's IRQ path can keep up; pad port ACKs the last byte too (the game's pad driver waits for it) |
+| CPU timing | 2 cycles per instruction (was 1). At 1, the game's `VSync` timeout loops expired early and it printed `VSync: timeout` every frame; now none |
+| Controller | Controller port is emulated, but the title code never reads it (no SIO access, no BIOS pad calls, even after 2 min), so button input is **unverified**; cause still unknown |
 | Windows build (`src/main.cpp`, CMake, CI) | Written and type-checked, **never compiled with real SDL** -- first CI run may need a small fix |
 | Gouraud/dither/exact fill rules, semi-transparency edge cases | Approximate |
 

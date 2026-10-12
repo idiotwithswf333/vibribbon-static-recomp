@@ -35,7 +35,15 @@ struct Trace {
 class Cpu {
 public:
     uint32_t r[32] = {}, hi = 0, lo = 0, pc = 0, next_pc = 4, cop0[32] = {};
-    uint64_t icount = 0;
+    uint64_t icount = 0;            // CPU cycles (33.8688 MHz clock)
+    uint32_t cycles_per_instr = 2;  // real CPU averages >1 cycle/instr (memory waits); 1 made timeout loops like VSync run too fast
+    uint64_t next_vblank = 677376;
+    // ---- real BIOS mode: ROM mapped at 0xBFC00000, genuine exceptions, no HLE intercepts ----
+    std::vector<uint8_t> rom;
+    bool real_bios = false;
+    bool siolog = false; std::vector<std::string> siolog_v;   // optional pad-port log (diagnostics)
+    size_t cdlog_max = 400; bool cdlog = false; std::vector<std::string> cdlog_v;   // optional CD register access log (diagnostics)
+    bool cur_ds = false;   // the instruction being executed sits in the delay slot of a taken branch
     Trace trace;
     std::vector<uint8_t> ram = std::vector<uint8_t>(2 * 1024 * 1024);
     uint8_t scratch[1024] = {};
@@ -57,7 +65,8 @@ public:
         if (a >= 0x1F800000 && a < 0x1F800400) return rd(&scratch[a - 0x1F800000], size);
         if (a >= 0x1F801000 && a < 0x1F803000) return io_read(a, size);
         if (a >= 0x1F000000 && a < 0x1F800000) return 0xFFFFFFFFu;  // expansion 1: nothing there
-        if (a >= 0x1FC00000 && a < 0x1FC80000) return 0;            // BIOS ROM absent (HLE)
+        if (a >= 0x1FC00000 && a < 0x1FC80000) return rom.empty() ? 0 : rd(&rom[(a - 0x1FC00000) & 0x7FFFF], size);   // BIOS ROM (0 when running HLE)
+        if (a == 0xFFFE0130) return 0;  // cache control
         halt("bus read at " + hex(va)); return 0;
     }
     void write(uint32_t va, uint32_t v, int size) {
@@ -83,10 +92,22 @@ public:
     // ---- execution --------------------------------------------------------
     void step() {
         if (halted) return;
-        if (hook_buf && irq_ready()) take_irq();
-        uint32_t p = phys(pc);
-        if (p == 0xA0 || p == 0xB0 || p == 0xC0) { bios_call(p); return; }
+        if (real_bios) {
+            // Hardware interrupt line (I_STAT & I_MASK) feeds Cause.IP2.
+            if (rd(&io[0x70], 4) & rd(&io[0x74], 4) & 0x7FF) cop0[13] |= 0x400; else cop0[13] &= ~0x400u;
+            if ((cop0[12] & 1) && (cop0[12] & cop0[13] & 0xFF00)) {
+                if (pend.reg) r[pend.reg] = pend.val;   // an in-flight load completes before the handler runs
+                pend = {}; prev = {};
+                take_exception(0, pc, next_pc != pc + 4);
+                return;
+            }
+        } else {
+            if (hook_buf && irq_ready()) take_irq();
+            uint32_t p = phys(pc);
+            if (p == 0xA0 || p == 0xB0 || p == 0xC0) { bios_call(p); return; }
+        }
         uint32_t cur = pc;
+        cur_ds = next_pc != pc + 4;
         uint32_t i = read(cur, 4);
         if (halted) return;
         if (trace.enabled) trace.pc_hist[cur]++;
@@ -96,10 +117,10 @@ public:
         exec(i, cur);
         if (prev.reg && prev.reg != wreg && prev.reg != pend.reg) r[prev.reg] = prev.val;
         r[0] = 0;
-        ++icount;
+        icount += cycles_per_instr;
         if (cd.tick(icount)) irq_set(2);
         if (ack_due && icount >= ack_due) { ack_due = 0; sio_irq = true; if (rd(&io[0x4A], 2) & 0x1000) irq_set(7); }
-        if (icount % 677376 == 0) { uint32_t st = rd(&io[0x70], 4) | 1u; wr(&io[0x70], st, 4); ++vblanks; }  // PAL 50 Hz
+        if (icount >= next_vblank) { next_vblank += 677376; uint32_t st = rd(&io[0x70], 4) | 1u; wr(&io[0x70], st, 4); ++vblanks; }  // PAL 50 Hz
     }
     uint64_t vblanks = 0, irqs_taken = 0;
     // n stereo frames (interleaved int16) of everything audible: SPU voices + CD audio.
@@ -134,10 +155,11 @@ private:
     uint32_t io_read(uint32_t a, int size) {
         if (trace.enabled) trace.io_reads[a]++;
         uint32_t off = a - 0x1F801000;
+        if (siolog && siolog_v.size() < 400 && (a == 0x1F801040 || a == 0x1F801044)) { char b[96]; std::snprintf(b, sizeof b, "  %s %s rx=%02X ready=%d irq=%d (pc=%08X)", a == 0x1F801040 ? "RD data" : "RD stat", "", sio_rx, (int)sio_rx_ready, (int)sio_irq, pc); siolog_v.push_back(b); }
         if (a == 0x1F801040) { sio_rx_ready = false; return sio_rx; }
         if (a == 0x1F801044) return 0x5u | (sio_rx_ready ? 2u : 0u) | (sio_irq ? 0x200u : 0u) | 0x80u * (!sio_irq);
         if (a == 0x1F801814) return gpu.stat();
-        if (a >= 0x1F801800 && a <= 0x1F801803) return cd.read8(a - 0x1F801800);
+        if (a >= 0x1F801800 && a <= 0x1F801803) { uint32_t v = cd.read8(a - 0x1F801800); if (cdlog && cdlog_v.size() < cdlog_max) { char b[80]; std::snprintf(b, sizeof b, "R %d -> %02X  (pc=%08X)", (int)(a - 0x1F801800), v, pc); cdlog_v.push_back(b); } return v; }
         if (a >= 0x1F801C00 && a < 0x1F801E00) return spu.read(a - 0x1F801C00, size);
         if (a == 0x1F801810) return gpu.read_gpuread();
         // Root counters: current values derived from elapsed instructions (~1 cycle each).
@@ -149,7 +171,8 @@ private:
     void io_write(uint32_t a, uint32_t v, int size) {
         if (trace.enabled) { trace.io_writes[a]++; if (!trace.io_first_write.count(a)) trace.io_first_write[a] = v; }
         uint32_t off = a - 0x1F801000;
-        if (a >= 0x1F801800 && a <= 0x1F801803) { cd.write8(a - 0x1F801800, (uint8_t)v); return; }
+        if (a == 0x1F802023) { trace.log.push_back((char)v); return; }   // BIOS tty (DUART) output
+        if (a >= 0x1F801800 && a <= 0x1F801803) { if (cdlog && cdlog_v.size() < cdlog_max) { char b[80]; std::snprintf(b, sizeof b, "W %d <- %02X  (pc=%08X)", (int)(a - 0x1F801800), v & 0xFF, pc); cdlog_v.push_back(b); } cd.write8(a - 0x1F801800, (uint8_t)v); return; }
         if (a == 0x1F801040) { sio_tx((uint8_t)v); return; }
         if (a == 0x1F80104A) {
             wr(&io[off], v, 2);
@@ -192,8 +215,8 @@ private:
             case 0x07: set(rd_, (int32_t)B >> (A & 31)); break;
             case 0x08: next_pc = A; break;
             case 0x09: { uint32_t t = A; set(rd_, cur + 8); next_pc = t; if (trace.enabled) trace.calls[t]++; break; }
-            case 0x0C: syscall(); break;
-            case 0x0D: halt("BREAK executed"); break;
+            case 0x0C: if (real_bios) take_exception(8, cur, cur_ds); else syscall(); break;
+            case 0x0D: if (real_bios) take_exception(9, cur, cur_ds); else halt("BREAK executed"); break;
             case 0x10: set(rd_, hi); break;
             case 0x11: hi = A; break;
             case 0x12: set(rd_, lo); break;
@@ -243,7 +266,7 @@ private:
         case 0x0F: set(rt, imm << 16); break;
         case 0x10:  // COP0
             if (rs == 0x00) set(rt, cop0[rd_]);
-            else if (rs == 0x04) cop0[rd_] = B;
+            else if (rs == 0x04) { if (real_bios && rd_ == 13) cop0[13] = (cop0[13] & ~0x300u) | (B & 0x300u); else if (real_bios && rd_ == 14) {} else cop0[rd_] = B; }
             else if ((i & 0x3F) == 0x10) cop0[12] = (cop0[12] & ~0xFu) | ((cop0[12] >> 2) & 0xF);  // RFE
             else halt("unknown COP0 " + hex(i));
             break;
@@ -284,6 +307,58 @@ private:
         }
     }
     uint32_t cur_val(uint32_t reg) { return (prev.reg == reg) ? prev.val : r[reg]; }  // LWL/LWR see an in-flight load
+
+    // Genuine R3000 exception entry. epc_pc = address of the faulting instruction (or of the
+    // instruction that would run next for an interrupt); ds = it is in a taken branch's delay slot.
+    void take_exception(uint32_t code, uint32_t epc_pc, bool ds) {
+        cop0[14] = ds ? epc_pc - 4 : epc_pc;
+        cop0[13] = (cop0[13] & ~0x8000007Cu) | (code << 2) | (ds ? 0x80000000u : 0);
+        cop0[12] = (cop0[12] & ~0x3Fu) | ((cop0[12] << 2) & 0x3Cu);
+        pc = (cop0[12] & 0x400000) ? 0xBFC00180u : 0x80000080u;
+        next_pc = pc + 4;
+        if (code == 0) ++irqs_taken;
+    }
+public:
+    bool load_bios(const std::string& path) {
+        FILE* f = std::fopen(path.c_str(), "rb"); if (!f) return false;
+        rom.assign(512 * 1024, 0);
+        size_t n = std::fread(rom.data(), 1, rom.size(), f); std::fclose(f);
+        if (n < 0x10000) { rom.clear(); return false; }
+        real_bios = true; reset_cpu(); return true;
+    }
+    // Call a kernel function through the real BIOS jump tables (table = 0xA0/0xB0/0xC0) and run until it returns.
+    bool call_bios(uint32_t table, uint32_t fn, uint32_t a0 = 0, uint32_t a1 = 0, uint32_t a2 = 0, uint64_t limit = 20000000) {
+        const uint32_t magic = 0x8000FFF0u;
+        uint32_t sv_sp = r[29];
+        r[4] = a0; r[5] = a1; r[6] = a2; r[9] = fn; r[31] = magic;
+        if (r[29] < 0x80000000u || r[29] > 0x80200000u) r[29] = 0x801FFF00u;
+        pc = table; next_pc = table + 4; pend = {}; prev = {};
+        uint64_t end = icount + limit;
+        while (!halted && pc != magic && icount < end) step();
+        r[29] = sv_sp;
+        return !halted && pc == magic;
+    }
+    // What the BIOS shell does for a disc: SetConf from SYSTEM.CNF, load the EXE, flush, jump to it.
+    bool sideload_exe(const std::vector<uint8_t>& text, uint32_t load, uint32_t pc0, uint32_t gp, uint32_t sp,
+                      uint32_t events, uint32_t tcbs, uint32_t stack_top) {
+        cop0[12] &= ~1u;   // interrupts off while we reconfigure the kernel
+        if (!call_bios(0xA0, 0x9C, events, tcbs, stack_top)) { halt("SetConf failed"); return false; }
+        std::memcpy(&ram[load & 0x1FFFFF], text.data(), text.size());
+        if (!call_bios(0xA0, 0x44)) { halt("FlushCache failed"); return false; }   // FlushCache
+        for (int i = 1; i < 32; ++i) r[i] = 0;
+        r[28] = gp; r[29] = r[30] = sp ? sp : stack_top; r[4] = 1; r[5] = 0; r[31] = 0x80030000u;
+        pc = pc0; next_pc = pc0 + 4; pend = {}; prev = {};
+        return true;
+    }
+    void reset_cpu() {
+        std::memset(r, 0, sizeof r); hi = lo = 0;
+        std::memset(cop0, 0, sizeof cop0);
+        cop0[12] = 0x00400000;   // BEV=1, interrupts off
+        cop0[15] = 0x00000002;   // PRId
+        pc = 0xBFC00000u; next_pc = pc + 4; pend = {}; prev = {};
+        halted = false; icount = 0; next_vblank = 677376;
+    }
+private:
 
     // ---- syscall (HLE of the BIOS exception handler's syscall paths) -------
     void syscall() {
@@ -440,9 +515,10 @@ private:
             case 1: reply = 0x41; more = true; sio_idx = 2; break;                 // digital pad ID
             case 2: reply = 0x5A; more = true; sio_idx = 3; break;
             case 3: reply = (uint8_t)(w & 0xFF); more = true; sio_idx = 4; break;
-            case 4: reply = (uint8_t)(w >> 8); sio_idx = 0; break;
+            case 4: reply = (uint8_t)(w >> 8); more = true; sio_idx = 0; break;   // ACK after the last byte too: the game's pad driver waits for it
             }
         }
+        if (siolog && siolog_v.size() < 400) { char b[96]; std::snprintf(b, sizeof b, "tx=%02X rx=%02X port2=%d idx=%d ctrl=%04X (pc=%08X)", v, reply, (int)port2, sio_idx, rd(&io[0x4A], 2), pc); siolog_v.push_back(b); }
         sio_rx = reply; sio_rx_ready = true;
         if (more) ack_due = icount + 300;
     }

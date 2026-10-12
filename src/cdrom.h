@@ -22,6 +22,8 @@ public:
     bool playing = false, muted = false;
     uint32_t dbg_loc() const { return loc; }
     uint8_t dbg_mode() const { return mode; }
+    std::vector<std::string> cmd_hist;   // every command with timestamp, for diagnostics
+    std::vector<uint32_t> setloc_hist;   // every Setloc target (LBA), for diagnostics
     std::vector<std::string> dbg_log;   // first commands, for diagnostics
 
     uint8_t read8(uint32_t reg) {
@@ -105,7 +107,7 @@ private:
     std::vector<uint8_t> da_sec; int da_off = 0; bool da_loaded = false; uint32_t da_lba = 0;
     int cdvol[4] = {0x80, 0, 0, 0x80};   // BIOS default: L->L, L->R, R->L, R->R
 
-    static constexpr uint64_t kFirst = 15000, kSecond = 30000, kSector = 30000;
+    static constexpr uint64_t kFirst = 15000, kSecond = 30000, kSector = 90000;   // ~375 sectors/s: faster than a real 2x drive (150/s) but slower than the real kernel IRQ path
 
     uint8_t stat() const { return playing ? 0x82 : 0x02; }
     uint8_t stat_reading() const { return 0x22; }
@@ -134,6 +136,7 @@ private:
     }
     void command(uint8_t c) {
         ++cmds;
+        if (cmd_hist.size() < 100000) { char b[48]; std::snprintf(b, sizeof b, "%llu cmd %02X np=%zu", (unsigned long long)now_, c, params.size()); cmd_hist.push_back(b); }
         if (dbg_log.size() < 40) { char b[96]; std::snprintf(b, sizeof b, "cmd %02X params=%zu p0=%02X p1=%02X p2=%02X", c, params.size(), params.size()>0?params[0]:0, params.size()>1?params[1]:0, params.size()>2?params[2]:0); dbg_log.push_back(b); }
         std::vector<uint8_t> p(params.begin(), params.end());
         params.clear(); resp.clear();
@@ -144,6 +147,7 @@ private:
         case 0x02: if (p.size() >= 3) {                                          // Setloc
                        unsigned f = (unbcd(p[0]) * 60 + unbcd(p[1])) * 75 + unbcd(p[2]);
                        loc = f >= 150 ? f - 150 : 0;
+                       if (setloc_hist.size() < 100000) setloc_hist.push_back(loc);
                    }
                    push(t, 3, {stat()}); break;
         case 0x06: case 0x1B:                                                    // ReadN / ReadS

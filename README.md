@@ -12,8 +12,11 @@ in this repo, and the picture is drawn by a software rasterizer.
 1. Push this repo to GitHub. The **build** workflow runs automatically and
    publishes a `vibribbon-windows` artifact (Actions tab -> latest run).
    Push a tag like `v0.1` to also get a downloadable Release.
-2. Unzip, run `vibribbon.exe`, and **drag `vibribbon.cue` onto the window**
-   (or drag the .cue onto the .exe). The title screen comes up in a few seconds.
+2. Unzip, then put your PS1 **BIOS** (a 512 KB `.bin`, any name) in the same folder as `vibribbon.exe`.
+   You can also just **drag the BIOS file onto the window** once; it is copied next to the exe as `bios.bin`.
+   The BIOS is required for the controller/keyboard to work (see Status).
+3. Run `vibribbon.exe` and **drag `vibribbon.cue` onto the window** (or drag the .cue onto the .exe).
+   The title screen comes up in a few seconds. Without a BIOS it still boots, but input is dead and the title bar says so.
 
 Keys: Esc quits, F11 toggles fullscreen.
 
@@ -40,16 +43,16 @@ Keyboard: arrows or WASD = D-pad, Z/Space = Cross, X = Circle, C = Square, V = T
 | Speed | ~60 fps headless in the dev sandbox (target 50); Windows speed not yet measured |
 | `MAIN_G.EXE` (the actual game), `MAIN_K.EXE` (kiosk) | Not tested yet |
 | Sound (SPU: 24 ADPCM voices, ADSR) and CD-DA audio tracks | Implemented; title-screen sound verified headlessly, CD-DA verified against the disc's audio tracks. Not implemented: reverb, noise, pitch modulation, volume sweeps |
-| Real BIOS boot (work in progress) | `Cpu::load_bios()` + `Cpu::sideload_exe()` boot a real BIOS ROM to the shell (0x80030000), then side-load the disc's boot EXE under the real kernel. **Not yet wired into `main.cpp`.** Headless demos: `tests/bios_boot.cpp`, `tests/bios_title.cpp bios.bin game.cue out_prefix [frames]`. With it the title reads the pad and the language menu responds to input |
+| Real BIOS boot | Wired into `main.cpp`: the app finds/accepts your BIOS, boots it to the shell (~0.1 s), then side-loads the disc's boot EXE under the real kernel. Headless demos: `tests/bios_boot.cpp`, `tests/bios_title.cpp`, `tests/menu_nav.cpp` |
 | CD timing | Sector rate slowed to 90000 cycles/sector so the real kernel's IRQ path can keep up; pad port ACKs the last byte too (the game's pad driver waits for it) |
 | CPU timing | 2 cycles per instruction (was 1). At 1, the game's `VSync` timeout loops expired early and it printed `VSync: timeout` every frame; now none |
-| Controller | Controller port is emulated, but the title code never reads it (no SIO access, no BIOS pad calls, even after 2 min), so button input is **unverified**; cause still unknown |
+| Controller / keyboard | **Works with a BIOS**: verified headlessly with scripted button taps (CROSS confirms the language, DOWN/UP move through GAME / HOW TO PLAY / LANGUAGE). Without a BIOS the game never starts its pad driver, so input is dead. A short tap can move the selection two steps (the game sees a 6-frame press as two presses) |
 | Windows build (`src/main.cpp`, CMake, CI) | Written and type-checked, **never compiled with real SDL** -- first CI run may need a small fix |
 | Gouraud/dither/exact fill rules, semi-transparency edge cases | Approximate |
 
 ## Layout
 
-- `src/cpu.h` - R3000 interpreter, memory map, high-level BIOS (BIOS ROM is not needed)
+- `src/cpu.h` - R3000 interpreter, memory map, real-BIOS boot (`load_bios`/`sideload_exe`) and a fallback high-level BIOS
 - `src/gpu.h`, `src/gte.h`, `src/cdrom.h`, `src/disc.h` - hardware and disc reading
 - `src/main.cpp` - SDL window, drag-and-drop, controller
 - `tests/` - unit tests (`cpu_test`, `pad_map_test`, run in CI) and headless tools that need your disc:

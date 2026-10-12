@@ -35,3 +35,6 @@ add_executable(disc_info tests/disc_info.cpp)
 add_executable(boot_trace tests/boot_trace.cpp)
 add_executable(title_shot tests/title_shot.cpp)
 add_executable(audio_test tests/audio_test.cpp)
+add_executable(bios_boot tests/bios_boot.cpp)
+add_executable(bios_title tests/bios_title.cpp)
+add_executable(menu_nav tests/menu_nav.cpp)   # menu_nav bios.bin game.cue prefix -- taps buttons, saves screenshots

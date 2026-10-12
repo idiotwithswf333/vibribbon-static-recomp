@@ -5,6 +5,9 @@
 #include <SDL.h>
 
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -83,6 +86,35 @@ struct Emulator {
     std::unique_ptr<cpu::Cpu> cpu;
 };
 
+// A PS1 BIOS image is exactly 512 KB and contains the Sony copyright string.
+bool looks_like_bios(const std::filesystem::path& p) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(p, ec) || std::filesystem::file_size(p, ec) != 512 * 1024) return false;
+    std::ifstream f(p, std::ios::binary);
+    std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return data.find("Sony Computer Entertainment") != std::string::npos;
+}
+
+// Look for a BIOS next to the exe, in the working directory, and next to the disc image.
+std::string find_bios(const std::string& cue) {
+    std::vector<std::filesystem::path> dirs;
+    if (char* base = SDL_GetBasePath()) { dirs.push_back(base); SDL_free(base); }
+    dirs.push_back(std::filesystem::current_path());
+    if (!cue.empty()) dirs.push_back(std::filesystem::path(cue).parent_path());
+    for (auto& d : dirs) {
+        std::error_code ec;
+        if (d.empty() || !std::filesystem::is_directory(d, ec)) continue;
+        for (auto& e : std::filesystem::directory_iterator(d, ec)) {
+            std::string ext = e.path().extension().string();
+            for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+            if (ext == ".bin" && looks_like_bios(e.path())) return e.path().string();
+        }
+    }
+    return "";
+}
+
+std::string g_bios;   // path of the BIOS in use ("" = none found)
+
 // Returns an empty string on success, otherwise a message for the window title.
 std::string boot_disc(const std::string& cue, Emulator& emu) {
     auto img = std::make_unique<disc::Image>();
@@ -95,14 +127,29 @@ std::string boot_disc(const std::string& cue, Emulator& emu) {
         return "Error: no bootable PS1 executable on disc";
     if (boot != "SCES_028.73")
         return "This is " + boot + ", not the Vib-Ribbon EU disc (SCES_028.73); not supported";
+    if (g_bios.empty()) g_bios = find_bios(cue);
+
     auto cpu = std::make_unique<cpu::Cpu>();
     cpu->trace.enabled = false;   // statistics are for the headless tools; they cost a lot of speed
     cpu->attach_disc(img.get());
-    cpu->load_exe(exe.text, exe.load_addr, exe.pc, exe.gp, exe.sp);
+    std::string note;
+    if (!g_bios.empty() && cpu->load_bios(g_bios)) {
+        // Real BIOS: boot to the shell (~5 million instructions, a fraction of a second), then start the
+        // disc's executable under the real kernel exactly as the shell would. The kernel is what makes the
+        // game's controller driver run, so buttons only work this way.
+        while (!cpu->halted && cpu->pc != 0x80030000u && cpu->icount < 100000000ull) cpu->step();
+        if (cpu->halted || cpu->pc != 0x80030000u)
+            return "BIOS did not reach the shell: " + (cpu->halted ? cpu->halt_reason : std::string("timeout"));
+        if (!cpu->sideload_exe(exe.text, exe.load_addr, exe.pc, exe.gp, exe.sp, 10, 4, 0x801FFFF0u))
+            return "Could not start the game: " + cpu->halt_reason;
+    } else {
+        cpu->load_exe(exe.text, exe.load_addr, exe.pc, exe.gp, exe.sp);
+        note = "No BIOS found - controller will NOT work. Put your PS1 BIOS (.bin, 512 KB) next to vibribbon.exe or drop it on the window.";
+    }
     emu.cpu.reset();
     emu.img = std::move(img);
     emu.cpu = std::move(cpu);
-    return "";
+    return note.empty() ? "" : "!" + note;   // leading '!' = started, but with a warning
 }
 
 }  // namespace
@@ -139,10 +186,19 @@ int main(int argc, char** argv) {
     bool fullscreen = false;
     uint32_t frames = 0, last_title = SDL_GetTicks();
 
+    std::string last_cue;
+    uint32_t warn_until = 0;
     auto start = [&](const std::string& cue) {
+        last_cue = cue;
         std::string msg = boot_disc(cue, emu);
-        if (!msg.empty()) { SDL_SetWindowTitle(win, msg.c_str()); std::printf("%s\n", msg.c_str()); }
-        else SDL_SetWindowTitle(win, "Vib-Ribbon");
+        if (msg.empty()) SDL_SetWindowTitle(win, "Vib-Ribbon");
+        else {
+            bool warn = msg[0] == '!';
+            if (warn) msg = msg.substr(1);
+            SDL_SetWindowTitle(win, msg.c_str());
+            std::printf("%s\n", msg.c_str());
+            if (warn) warn_until = SDL_GetTicks() + 15000; else emu.cpu.reset();
+        }
     };
     if (argc > 1) start(argv[1]);
 
@@ -150,7 +206,19 @@ int main(int argc, char** argv) {
         uint32_t frame_start = SDL_GetTicks();
         for (SDL_Event e; SDL_PollEvent(&e);) {
             if (e.type == SDL_QUIT) running = false;
-            if (e.type == SDL_DROPFILE) { start(e.drop.file); SDL_free(e.drop.file); }
+            if (e.type == SDL_DROPFILE) {
+                std::filesystem::path dropped = e.drop.file;
+                if (looks_like_bios(dropped)) {   // a BIOS dropped on the window: remember it next to the exe and restart
+                    g_bios = dropped.string();
+                    if (char* base = SDL_GetBasePath()) {
+                        std::error_code ec; std::filesystem::copy_file(dropped, std::filesystem::path(base) / "bios.bin",
+                                                                       std::filesystem::copy_options::overwrite_existing, ec);
+                        SDL_free(base);
+                    }
+                    if (!last_cue.empty()) start(last_cue); else SDL_SetWindowTitle(win, "BIOS loaded - now drop vibribbon.cue");
+                } else start(e.drop.file);
+                SDL_free(e.drop.file);
+            }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F11) {
                 fullscreen = !fullscreen;
@@ -200,7 +268,7 @@ int main(int argc, char** argv) {
         SDL_RenderPresent(ren);
 
         uint32_t now = SDL_GetTicks();
-        if (emu.cpu && now - last_title >= 1000) {   // FPS in the title bar
+        if (emu.cpu && now - last_title >= 1000 && now > warn_until) {   // FPS in the title bar
             char t[96];
             std::snprintf(t, sizeof t, "Vib-Ribbon - %u fps (target 50)", frames);
             SDL_SetWindowTitle(win, t);

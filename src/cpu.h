@@ -172,7 +172,8 @@ private:
         if (trace.enabled) { trace.io_writes[a]++; if (!trace.io_first_write.count(a)) trace.io_first_write[a] = v; }
         uint32_t off = a - 0x1F801000;
         if (a == 0x1F802023) { trace.log.push_back((char)v); return; }   // BIOS tty (DUART) output
-        if (a >= 0x1F801800 && a <= 0x1F801803) { if (cdlog && cdlog_v.size() < cdlog_max) { char b[80]; std::snprintf(b, sizeof b, "W %d <- %02X  (pc=%08X)", (int)(a - 0x1F801800), v & 0xFF, pc); cdlog_v.push_back(b); } cd.write8(a - 0x1F801800, (uint8_t)v); return; }
+        if (a == 0x1F801050 && trace.log.size() < 65536) { trace.log.push_back((char)v); return; }   // SIO1 TX (BIOS tty over serial)
+        if (a >= 0x1F801800 && a <= 0x1F801803) { if (cdlog && cdlog_v.size() < cdlog_max) { char b[96]; std::snprintf(b, sizeof b, "W %d <- %02X  (pc=%08X ra=%08X sp=%08X)", (int)(a - 0x1F801800), v & 0xFF, pc, r[31], r[29]); cdlog_v.push_back(b); } cd.write8(a - 0x1F801800, (uint8_t)v); return; }
         if (a == 0x1F801040) { sio_tx((uint8_t)v); return; }
         if (a == 0x1F80104A) {
             wr(&io[off], v, 2);

@@ -136,7 +136,7 @@ private:
     }
     void command(uint8_t c) {
         ++cmds;
-        if (cmd_hist.size() < 100000) { char b[48]; std::snprintf(b, sizeof b, "%llu cmd %02X np=%zu", (unsigned long long)now_, c, params.size()); cmd_hist.push_back(b); }
+        if (cmd_hist.size() < 100000) { char b[80]; std::snprintf(b, sizeof b, "%llu cmd %02X np=%zu p=%02X %02X %02X", (unsigned long long)now_, c, params.size(), params.size()>0?params[0]:0, params.size()>1?params[1]:0, params.size()>2?params[2]:0); cmd_hist.push_back(b); }
         if (dbg_log.size() < 40) { char b[96]; std::snprintf(b, sizeof b, "cmd %02X params=%zu p0=%02X p1=%02X p2=%02X", c, params.size(), params.size()>0?params[0]:0, params.size()>1?params[1]:0, params.size()>2?params[2]:0); dbg_log.push_back(b); }
         std::vector<uint8_t> p(params.begin(), params.end());
         params.clear(); resp.clear();

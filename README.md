@@ -61,3 +61,15 @@ Keyboard: arrows or WASD = D-pad, Z/Space = Cross, X = Circle, C = Square, V = T
   - `title_shot game.cue prefix` - boot to the title, press some buttons, save PPM screenshots
 - `tools/extract_disc.py` - extract the files from a BIN/CUE
 - `config/` - early splat configs from the decompilation approach (not used by the build)
+
+## Status after choosing GAME on the title menu (diagnosis notes)
+
+* The CD side is not what is stuck: after the language screen the game reads the drive continuously from
+  LBA 0 (`ReadS`, mode A0) and polls `GetlocP` once per frame; the drive keeps answering. Its disc-monitor
+  state machine (game code around 0x8001ED6C) just idles on those polls.
+* The garbled line art on the "loading" scene comes from bad projected coordinates: `tests/gpu_capture.cpp`
+  shows the GP0 line vertices are wild and many are clamped to the +-0x400 corners (title frame vertices are
+  sane). So the 3D transform inputs (rotation/translation from `loading.tmd`/`loading.anm`) or a GTE detail
+  are wrong; the GTE commands used there are RTPS, RTPT, NCLIP and MVMVA (Rot matrix, V0/IR vectors).
+* Next step: compare GTE register state (RT/TR matrices, H, OFX/OFY) at the first RTPS of that scene against
+  known-good values, and check the game's software matrix code (MULT/DIV/shift paths).

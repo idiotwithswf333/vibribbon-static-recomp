@@ -16,7 +16,9 @@ public:
     std::map<uint32_t, uint64_t> cmd_hist;   // GP0 command byte -> count
 
     // ---- register interface -------------------------------------------------
+    std::vector<uint32_t>* gp0_log = nullptr;   // optional capture of every GP0 word (diagnostics)
     void gp0(uint32_t w) {
+        if (gp0_log && gp0_log->size() < 200000) gp0_log->push_back(w);
         if (xfer_in_) { feed_xfer(w); return; }
         if (poly_) { polyline_word(w); return; }
         fifo_.push_back(w);

@@ -61,16 +61,21 @@ public:
     void audio_samples(int n, int16_t* out) {
         for (int i = 0; i < n; ++i) {
             int l = 0, r = 0;
-            if (playing && !muted) {
+            // Note: Mute (cmd 0x0B) only silences the output. The disc keeps spinning and the read position
+            // keeps advancing, so the game can poll GetlocP and Demute once it reaches the track start.
+            // (Vib-Ribbon does exactly that; freezing the position while muted deadlocks its loading screen.)
+            if (playing) {
                 if (!da_loaded) {
                     uint32_t sz = 0; da_sec.assign(2352, 0);
                     if (!img || !img->raw_sector(da_lba, da_sec.data(), &sz) || sz != 2352) { playing = false; }
                     da_loaded = true; da_off = 0;
                 }
                 if (playing) {
-                    const uint8_t* p = &da_sec[da_off * 4];
-                    int L = (int16_t)(p[0] | p[1] << 8), R = (int16_t)(p[2] | p[3] << 8);
-                    l = (L * cdvol[0] + R * cdvol[2]) >> 7; r = (R * cdvol[3] + L * cdvol[1]) >> 7;
+                    if (!muted) {
+                        const uint8_t* p = &da_sec[da_off * 4];
+                        int L = (int16_t)(p[0] | p[1] << 8), R = (int16_t)(p[2] | p[3] << 8);
+                        l = (L * cdvol[0] + R * cdvol[2]) >> 7; r = (R * cdvol[3] + L * cdvol[1]) >> 7;
+                    }
                     if (++da_off >= 588) { da_off = 0; ++da_lba; da_loaded = false; }
                 }
             }

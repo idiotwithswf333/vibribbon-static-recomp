@@ -41,12 +41,13 @@ Keyboard: arrows or WASD = D-pad, Z/Space = Cross, X = Circle, C = Square, V = T
 | Loader boots, reads the disc, starts the title (`MAIN_T.EXE`) | Works (tested headlessly on the EU disc) |
 | Title screen: animated vector logo, language menu, copyright line | Renders correctly (checked via screenshots) |
 | Speed | ~60 fps headless in the dev sandbox (target 50); Windows speed not yet measured |
-| `MAIN_G.EXE` (the actual game), `MAIN_K.EXE` (kiosk) | Not tested yet |
+| **HOW TO PLAY** (loads `MAIN_K.EXE` + `KIOSK/*`, plays CD-DA track 8) | **Works**: loading screen then the full tutorial runs (`tests/howto_e2e.cpp`) |
+| `MAIN_G.EXE` (GAME on the title menu) | Not tested yet |
 | Sound (SPU: 24 ADPCM voices, ADSR) and CD-DA audio tracks | Implemented; title-screen sound verified headlessly, CD-DA verified against the disc's audio tracks. Not implemented: reverb, noise, pitch modulation, volume sweeps |
 | Real BIOS boot | Wired into `main.cpp`: the app finds/accepts your BIOS, boots it to the shell (~0.1 s), then side-loads the disc's boot EXE under the real kernel. Headless demos: `tests/bios_boot.cpp`, `tests/bios_title.cpp`, `tests/menu_nav.cpp` |
 | CD timing | Sector rate slowed to 90000 cycles/sector so the real kernel's IRQ path can keep up; pad port ACKs the last byte too (the game's pad driver waits for it) |
 | CPU timing | 2 cycles per instruction (was 1). At 1, the game's `VSync` timeout loops expired early and it printed `VSync: timeout` every frame; now none |
-| Controller / keyboard | **Works with a BIOS**: verified headlessly with scripted button taps (CROSS confirms the language, DOWN/UP move through GAME / HOW TO PLAY / LANGUAGE). Without a BIOS the game never starts its pad driver, so input is dead. A short tap can move the selection two steps (the game sees a 6-frame press as two presses) |
+| Controller / keyboard | **Works with a BIOS**: verified headlessly with scripted button taps (CROSS confirms the language, DOWN/UP move through GAME / HOW TO PLAY / LANGUAGE). Without a BIOS the game never starts its pad driver, so input is dead. The game's menus step twice for a D-pad press of 3+ frames (cause not found), so the app passes each new D-pad press for 2 frames only (`pad::TapFilter`, F10 toggles it) |
 | Windows build (`src/main.cpp`, CMake, CI) | Written and type-checked, **never compiled with real SDL** -- first CI run may need a small fix |
 | Gouraud/dither/exact fill rules, semi-transparency edge cases | Approximate |
 
@@ -62,14 +63,22 @@ Keyboard: arrows or WASD = D-pad, Z/Space = Cross, X = Circle, C = Square, V = T
 - `tools/extract_disc.py` - extract the files from a BIN/CUE
 - `config/` - early splat configs from the decompilation approach (not used by the build)
 
-## Status after choosing GAME on the title menu (diagnosis notes)
+## Fixed: the "stuck after choosing a menu item" bug
 
-* The CD side is not what is stuck: after the language screen the game reads the drive continuously from
-  LBA 0 (`ReadS`, mode A0) and polls `GetlocP` once per frame; the drive keeps answering. Its disc-monitor
-  state machine (game code around 0x8001ED6C) just idles on those polls.
-* The garbled line art on the "loading" scene comes from bad projected coordinates: `tests/gpu_capture.cpp`
-  shows the GP0 line vertices are wild and many are clamped to the +-0x400 corners (title frame vertices are
-  sane). So the 3D transform inputs (rotation/translation from `loading.tmd`/`loading.anm`) or a GTE detail
-  are wrong; the GTE commands used there are RTPS, RTPT, NCLIP and MVMVA (Rot matrix, V0/IR vectors).
-* Next step: compare GTE register state (RT/TR matrices, H, OFX/OFY) at the first RTPS of that scene against
-  known-good values, and check the game's software matrix code (MULT/DIV/shift paths).
+Two emulation bugs, both found by tracing what the game was waiting on:
+
+1. **SPU/CD-DA clock.** SPU voice envelopes and the CD-audio read position only advance inside `Cpu::audio_frame()`.
+   The game waits for a sound effect to finish (it polls the voice's ADSR volume), so with that clock frozen the
+   scribble transition never ended. `main.cpp` now calls `audio_frame()` every video frame, even with no audio
+   device. **Any headless tool must call `audio_frame(882, buf)` after each `run_frame()`.**
+2. **CD-DA Mute froze the read position.** The game sends Mute, plays track 8 from 5 sectors before the track
+   start, and only Demutes once `GetlocP` reaches the track start. `cdrom.h` stopped advancing the position while
+   muted, so it deadlocked on the LOADING screen. Mute now only silences output.
+
+The garbled line art on the first transition is the game's own scribble effect, not a GTE bug.
+
+## Still to do
+
+- Try GAME (`MAIN_G.EXE`) with the same harness.
+- Find why the menu double-steps on 3+ frame presses (the tap filter is a workaround).
+- `src/main.cpp` has not been compiled against SDL since the edits above.

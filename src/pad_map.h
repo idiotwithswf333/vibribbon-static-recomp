@@ -64,4 +64,24 @@ inline uint16_t to_ps1(const XboxState& s) {
 // What a game polling the pad via the BIOS/libpad expects: active-low.
 inline uint16_t to_wire(uint16_t active_high) { return static_cast<uint16_t>(~active_high); }
 
+// The game's menus step TWICE for a D-pad press that lasts 3+ frames (a human tap is 5-8 frames), so the cursor
+// skips items (GAME -> LANGUAGE, jumping over HOW TO PLAY). TapFilter passes each new D-pad press through for
+// `frames` frames only, then masks that direction until it is released. Face/shoulder/Start buttons are untouched.
+struct TapFilter {
+    bool enabled = true;
+    int frames = 2;
+    uint16_t apply(uint16_t w) {
+        static const uint16_t kBits[4] = {UP, DOWN, LEFT, RIGHT};
+        if (!enabled) { for (int& h : held_) h = 0; return w; }
+        uint16_t out = static_cast<uint16_t>(w & ~(UP | DOWN | LEFT | RIGHT));
+        for (int i = 0; i < 4; ++i) {
+            if (w & kBits[i]) { if (held_[i] < 1000000) ++held_[i]; if (held_[i] <= frames) out |= kBits[i]; }
+            else held_[i] = 0;
+        }
+        return out;
+    }
+private:
+    int held_[4] = {0, 0, 0, 0};
+};
+
 }  // namespace pad

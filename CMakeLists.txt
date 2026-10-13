@@ -41,3 +41,4 @@ add_executable(menu_nav tests/menu_nav.cpp)
 add_executable(game_try tests/game_try.cpp)
 add_executable(game_try2 tests/game_try2.cpp)
 add_executable(gpu_capture tests/gpu_capture.cpp)   # menu_nav bios.bin game.cue prefix -- taps buttons, saves screenshots
+add_executable(howto_e2e tests/howto_e2e.cpp)   # howto_e2e bios.bin game.cue prefix -- boots and taps through to the HOW TO PLAY tutorial (exit 0 = reached it)

@@ -80,6 +80,8 @@ uint16_t read_keyboard() {
     return w;
 }
 
+pad::TapFilter g_tap;   // see pad_map.h; F10 toggles it
+
 // One running game. The disc image must outlive the CPU that reads from it.
 struct Emulator {
     std::unique_ptr<disc::Image> img;
@@ -220,6 +222,10 @@ int main(int argc, char** argv) {
                 SDL_free(e.drop.file);
             }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F10) {
+                g_tap.enabled = !g_tap.enabled;
+                std::fprintf(stderr, "D-pad tap filter %s\n", g_tap.enabled ? "ON" : "OFF");
+            }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F11) {
                 fullscreen = !fullscreen;
                 SDL_SetWindowFullscreen(win, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
@@ -236,7 +242,7 @@ int main(int argc, char** argv) {
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
         SDL_RenderClear(ren);
         if (emu.cpu) {
-            emu.cpu->pad1 = pad::to_ps1(read_controller()) | read_keyboard();
+            emu.cpu->pad1 = g_tap.apply(pad::to_ps1(read_controller()) | read_keyboard());
             static uint16_t last_pad = 0;   // log pad changes so you can see the keyboard is being read
             if (emu.cpu->pad1 != last_pad) { last_pad = emu.cpu->pad1; std::fprintf(stderr, "pad: %04X\n", last_pad); }
             if (!emu.cpu->run_frame() && emu.cpu->halted) {
@@ -246,13 +252,13 @@ int main(int argc, char** argv) {
                 emu.cpu.reset();   // back to waiting for a disc
                 if (audio) SDL_ClearQueuedAudio(audio);
             } else {
-                if (audio) {
-                    // Keep the queue shallow (~100 ms) so sound stays in sync with the picture.
-                    if (SDL_GetQueuedAudioSize(audio) < (Uint32)kAudioFrames * 4 * 5) {
-                        emu.cpu->audio_frame(kAudioFrames, audio_buf.data());
-                        SDL_QueueAudio(audio, audio_buf.data(), (Uint32)audio_buf.size() * 2);
-                    } else emu.cpu->audio_frame(kAudioFrames, audio_buf.data());   // still advance the SPU
-                }
+                // The SPU voice envelopes and the CD-audio read position only advance inside audio_frame(), and
+                // the game WAITS on both (e.g. "has the sound effect finished?", "has the CD reached the track?").
+                // So this must run once per video frame even when there is no sound device or the queue is full.
+                emu.cpu->audio_frame(kAudioFrames, audio_buf.data());
+                // Keep the queue shallow (~100 ms) so sound stays in sync with the picture.
+                if (audio && SDL_GetQueuedAudioSize(audio) < (Uint32)kAudioFrames * 4 * 5)
+                    SDL_QueueAudio(audio, audio_buf.data(), (Uint32)audio_buf.size() * 2);
                 int w = 0, h = 0;
                 emu.cpu->gpu.display(pixels, w, h);
                 if (!tex || w != tex_w || h != tex_h) {

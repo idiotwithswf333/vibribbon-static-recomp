@@ -32,6 +32,20 @@ int main() {
     s = {}; s.start = true; s.back = true;
     CHECK(to_ps1(s) == (START | SELECT));
 
+
+    {   // TapFilter: a long D-pad hold becomes a 2-frame pulse; other buttons pass through; release re-arms
+        TapFilter tf;
+        int seen = 0;
+        for (int i = 0; i < 10; ++i) seen += (tf.apply(DOWN | CROSS) & DOWN) ? 1 : 0;
+        CHECK(seen == 2);
+        CHECK((tf.apply(DOWN | CROSS) & CROSS) != 0);   // CROSS is never filtered
+        CHECK(tf.apply(0) == 0);                          // released
+        CHECK((tf.apply(DOWN) & DOWN) != 0);              // next press works again
+        TapFilter off; off.enabled = false;
+        int seen2 = 0; for (int i = 0; i < 10; ++i) seen2 += (off.apply(DOWN) & DOWN) ? 1 : 0;
+        CHECK(seen2 == 10);
+    }
+
     if (failures == 0) std::puts("pad_map: all tests passed");
     return failures ? 1 : 0;
 }

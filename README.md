@@ -109,7 +109,9 @@ Reported: no music during levels. What I found by tracing a Bronze level:
   music (the data the game writes back into SPU RAM is all zeros; the only voices are sound effects).
 - **Workaround ("music assist")**: while the CD is playing, un-muted, and the game is *not* routing it through the SPU,
   the CD audio is mixed straight into the output (60 % level). `Cpu::music_assist`; **F9** toggles it in the app; the run
-  log's heartbeat shows `SPU CD input: on/off` and `music assist: idle / ACTIVE / disabled`.
+  log's heartbeat shows `SPU CD input: on/off` and `music assist: idle / ACTIVE / disabled`. The window title shows
+  `F9 music assist: ON/OFF (playing)` and `F10 tap filter: ON/OFF`, and the log notes when the assist engages.
+  It starts ON; each F9 press flips it, so an even number of presses leaves it as it was.
 - Caveat: the audio is live, not delayed. If the original delays the music relative to the ribbon, the beat may arrive
   early against the obstacles. Please report how it feels.
 

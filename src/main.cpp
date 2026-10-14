@@ -239,6 +239,7 @@ int main(int argc, char** argv) {
     uint64_t last_hash = 0, last_vblanks = 0; int same_hash = 0;
     std::string last_halt = "no", last_disc = "(none)";
     uint16_t cur_pad = 0;
+    bool assist_was_active = false;
     auto update_summary = [&](const char* how) {
         char b[900]; double run = g_log.elapsed();
         std::snprintf(b, sizeof b,
@@ -261,7 +262,7 @@ int main(int argc, char** argv) {
         std::string msg = boot_disc(cue, emu);
         g_log.note("BIOS in use: %s", g_bios.empty() ? "none found" : g_bios.c_str());
         g_log.note("Boot result: %s", msg.empty() ? "started OK" : msg.c_str());
-        last_halt = "no"; hb_last = SDL_GetTicks(); hb_frames = 0; same_hash = 0; last_hash = 0; last_vblanks = 0;
+        last_halt = "no"; assist_was_active = false; hb_last = SDL_GetTicks(); hb_frames = 0; same_hash = 0; last_hash = 0; last_vblanks = 0;
         if (msg.empty()) SDL_SetWindowTitle(win, "Vib-Ribbon");
         else {
             bool warn = msg[0] == '!';
@@ -354,14 +355,19 @@ int main(int argc, char** argv) {
                 SDL_UpdateTexture(tex, nullptr, pixels.data(), w * 4);
                 SDL_RenderCopy(ren, tex, nullptr, nullptr);
                 ++frames; ++hb_frames; ++total_frames;
+                if (emu.cpu->assist_active != assist_was_active) {   // log when the CD music is (un)mixed in directly
+                    assist_was_active = emu.cpu->assist_active;
+                    g_log.note(assist_was_active ? "Music assist ENGAGED: CD audio is being mixed straight into the output" : "Music assist released (CD stopped/muted, or the game is routing it itself)");
+                }
             }
         }
         SDL_RenderPresent(ren);
 
         uint32_t now = SDL_GetTicks();
         if (emu.cpu && now - last_title >= 1000 && now > warn_until) {   // FPS in the title bar
-            char t[96];
-            std::snprintf(t, sizeof t, "Vib-Ribbon - %u fps (target 50)", frames);
+            char t[160];
+            std::snprintf(t, sizeof t, "Vib-Ribbon - %u fps | F9 music assist: %s%s | F10 tap filter: %s", frames,
+                          emu.cpu->music_assist ? "ON" : "OFF", emu.cpu->assist_active ? " (playing)" : "", g_tap.enabled ? "ON" : "OFF");
             SDL_SetWindowTitle(win, t);
             frames = 0; last_title = now;
         }

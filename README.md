@@ -42,7 +42,9 @@ Keyboard: arrows or WASD = D-pad, Z/Space = Cross, X = Circle, C = Square, V = T
 | Title screen: animated vector logo, language menu, copyright line | Renders correctly (checked via screenshots) |
 | Speed | ~60 fps headless in the dev sandbox (target 50); Windows speed not yet measured |
 | **HOW TO PLAY** (loads `MAIN_K.EXE` + `KIOSK/*`, plays CD-DA track 8) | **Works**: loading screen then the full tutorial runs (`tests/howto_e2e.cpp`) |
-| `MAIN_G.EXE` (GAME on the title menu) | Not tested yet |
+| **GAME** hub (`MAIN_G.EXE`): Play with the vib-ribbon disc / Play with my own choice of CD / Options / Back | **Works**: all four bubbles navigate, one step per tap |
+| Difficulty menu (Bronze / Silver / Gold / High scores) | **Works** (Bronze verified) |
+| **Gameplay** (Bronze level) | **Runs**: Vibri runs, CD audio plays, and the ribbon (loops, zig-zags, terrain) is generated from the music. Playing it by hand is untested |
 | Sound (SPU: 24 ADPCM voices, ADSR) and CD-DA audio tracks | Implemented; title-screen sound verified headlessly, CD-DA verified against the disc's audio tracks. Not implemented: reverb, noise, pitch modulation, volume sweeps |
 | Real BIOS boot | Wired into `main.cpp`: the app finds/accepts your BIOS, boots it to the shell (~0.1 s), then side-loads the disc's boot EXE under the real kernel. Headless demos: `tests/bios_boot.cpp`, `tests/bios_title.cpp`, `tests/menu_nav.cpp` |
 | CD timing | Sector rate slowed to 90000 cycles/sector so the real kernel's IRQ path can keep up; pad port ACKs the last byte too (the game's pad driver waits for it) |
@@ -77,8 +79,45 @@ Two emulation bugs, both found by tracing what the game was waiting on:
 
 The garbled line art on the first transition is the game's own scribble effect, not a GTE bug.
 
+## Fixed: GAME stuck on LOADING, then no ribbon in the level
+
+3. **SPU IRQ (IRQ9).** After `MAIN_G.EXE` loads, the game programs an SPU IRQ address and waits for the interrupt.
+   The SPU now raises IRQ9 (SPUSTAT bit 6 + I_STAT bit 9) when a voice block fetch, a FIFO/DMA write, or the
+   capture-buffer write pointer touches that address; writing SPUCNT with bit 6 = 0 acknowledges it.
+4. **Capture buffers + SPU->RAM DMA.** Vib-Ribbon builds the ribbon by reading the CD audio *back out of the SPU*:
+   the capture buffers (CD-L @0x000, CD-R @0x400, voice 1 @0x800, voice 3 @0xC00, 512 samples each) are read by DMA
+   channel 4 (SPU -> RAM) whenever the SPU IRQ fires. DMA4 reads are implemented. The capture buffers receive the CD
+   signal regardless of the SPU's CD volume / enable bit (the game turns both off and still reads the audio).
+5. **44.1 kHz tick in the CPU loop.** The CD-DA position, capture buffers and SPU IRQ now advance every 768 CPU
+   cycles inside `Cpu::step()` (`spu_cd_tick`), so the IRQ cadence matches hardware (about 3.4 per video frame) and
+   headless tools no longer need `audio_frame()` for CD-DA or the IRQ. SPU **voice envelopes** still advance in
+   `audio_frame()`, so tools should still call it once per video frame.
+
+`tests/script_run.cpp` drives any menu path with a tiny script, for example
+`script_run bios.bin game.cue out "w1500 X w400 X w1500 X w150 X w300 p"` (wN = wait N frames, X/O/T/Q/U/D/L/R/S =
+6-frame taps through the tap filter, p = screenshot + state line).
+
+## Run log (`vibribbon-log.txt`)
+
+The app writes a plain-text log next to the exe (`src/runlog.h`). It is saved every 5 seconds and again when you
+close the window or press Esc, so a crash still leaves one behind. The previous run is kept as
+`vibribbon-log-previous.txt`. It records:
+
+- startup: SDL/video/audio/controller details, command-line arguments, which disc and BIOS were used, boot result;
+- events: files dropped on the window, F10 (tap filter) / F11 (fullscreen), controller connect/disconnect, CPU stops;
+- button presses sent to the game (first 400 only, with names such as `DOWN+CROSS`);
+- a **heartbeat every 5 s**: fps, game frames advanced, CPU position, CD/SPU activity, buttons held;
+- warnings: running slow (< 45 fps), game not advancing, **picture unchanged for 15 s / 60 s / 5 min** (likely stuck);
+- a summary at the end: run time, average/min/max fps, slow frames, button changes, last CPU position, exit reason.
+
+If something gets stuck, send `vibribbon-log.txt` and I can usually tell where.
+
 ## Still to do
 
-- Try GAME (`MAIN_G.EXE`) with the same harness.
+- `main.cpp` compiles cleanly with `-Wall -Wextra` against SDL 2.30 and was run headlessly with the dummy video/audio
+  drivers (50 fps, log written, clean close); on-screen display and real keyboard/controller input are still unverified.
+- Play a level by hand (button input during gameplay, scoring, level end, return to the menus).
+- Silver / Gold, High scores, Options.
+- "Play with my own choice of CD": needs a way to swap in a different CD image.
+- The CD-audio sector data path (`ReadS` data) is still never consumed; the game only needs the SPU capture path.
 - Find why the menu double-steps on 3+ frame presses (the tap filter is a workaround).
-- `src/main.cpp` has not been compiled against SDL since the edits above.

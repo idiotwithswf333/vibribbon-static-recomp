@@ -15,6 +15,11 @@ public:
     uint32_t xfer = 0;   // current sound-RAM transfer address (bytes)
     uint64_t key_ons = 0;
 
+    // SPU IRQ (IRQ9): raised when a voice block fetch, a FIFO/DMA write, or the capture-buffer write pointer touches
+    // the sound-RAM address in the IRQ-address register (0x1A4) while SPUCNT bit 6 is set. The flag shows in
+    // SPUSTAT bit 6 and is cleared by writing SPUCNT with bit 6 = 0. The CPU polls take_irq() and sets I_STAT bit 9.
+    bool take_irq() { bool f = irq_fired_; irq_fired_ = false; return f; }
+
     uint32_t read(uint32_t off, int size) const {
         uint32_t lo = rd16(off);
         if (size == 4) return lo | (uint32_t)rd16(off + 2) << 16;
@@ -31,7 +36,31 @@ public:
         }
     }
     void dma_write_word(uint32_t w) {   // RAM -> SPU RAM via DMA channel 4
+        check_irq(xfer); check_irq(xfer + 2);
         for (int i = 0; i < 4; ++i) ram[(xfer++) & 0x7FFFF] = (uint8_t)(w >> (8 * i));
+    }
+
+    // One 44.1 kHz tick of the capture buffers (CD-L @0x000, CD-R @0x400, voice1 @0x800, voice3 @0xC00, 512 samples
+    // each) and the SPU IRQ check. Driven by the CPU loop every 768 cycles so the IRQ cadence matches hardware.
+    void capture_tick(int cdl, int cdr) {
+        uint16_t cnt = reg_[0xD5];
+        if (!(cnt & 0x8000)) return;
+        uint32_t o = cap_idx_ * 2;
+        // The capture buffers receive the CD signal as it leaves the CD controller, regardless of the SPU's CD input
+        // volume / enable bit. Vib-Ribbon relies on this: it silences the CD input and still reads the audio back to
+        // analyze the music and build the ribbon.
+        int l = cdl, r = cdr;
+        put16(0x000 + o, l); put16(0x400 + o, r);
+        put16(0x800 + o, voices_[1].phase != Off ? voice_out_[1] : 0);
+        put16(0xC00 + o, voices_[3].phase != Off ? voice_out_[3] : 0);
+        if ((cnt & 0x40) && !irq_flag_) for (uint32_t base = 0; base < 0x1000; base += 0x400) check_irq(base + o);
+        cap_idx_ = (cap_idx_ + 1) & 0x1FF;
+    }
+    uint32_t dma_read_word() {   // SPU RAM -> RAM via DMA channel 4
+        check_irq(xfer); check_irq(xfer + 2);
+        uint32_t w = 0;
+        for (int i = 0; i < 4; ++i) w |= (uint32_t)ram[(xfer++) & 0x7FFFF] << (8 * i);
+        return w;
     }
 
     // Produce n stereo frames. cd may be null, or n interleaved stereo samples of CD audio.
@@ -48,6 +77,7 @@ public:
                     if (vo.phase == Off) continue;
                     int s = voice_sample(v);
                     s = (s * vo.env) >> 15;
+                    voice_out_[v] = (int16_t)std::clamp(s, -32768, 32767);
                     l += (s * vol(reg_[v * 8])) >> 15;
                     r += (s * vol(reg_[v * 8 + 1])) >> 15;
                 }
@@ -74,6 +104,16 @@ private:
     uint16_t reg_[0x100] = {};   // halfword registers, index = (addr - 0x1F801C00) / 2
     Voice voices_[24];
     uint32_t endx_ = 0;
+    bool irq_flag_ = false, irq_fired_ = false;
+    int16_t voice_out_[24] = {};
+    uint32_t cap_idx_ = 0;   // capture-buffer write pointer (0..511 samples; 4 buffers of 0x400 bytes at 0x000..0xFFF)
+
+    void check_irq(uint32_t byte_addr) {
+        if (!(reg_[0xD5] & 0x8000) || !(reg_[0xD5] & 0x40)) return;   // SPU enabled and IRQ enabled
+        if (((byte_addr & 0x7FFFF) >> 3) != ((uint32_t)reg_[0xD2] >> 0)) return;   // IRQ address reg is in 8-byte units
+        if (!irq_flag_) { irq_flag_ = true; irq_fired_ = true; }
+    }
+    void put16(uint32_t a, int v) { ram[a] = (uint8_t)v; ram[a + 1] = (uint8_t)(v >> 8); }
 
     static int vol(uint16_t r) { return (r & 0x8000) ? 0x3FFF : (int16_t)(r << 1); }   // sweep -> approx full
     uint16_t rd16(uint32_t off) const {
@@ -81,7 +121,7 @@ private:
         if (i < 0xC0 && (i & 7) == 6) return (uint16_t)std::min(voices_[i >> 3].env, 0x7FFF);   // current envelope (+0xC)
         if (i == 0xCE) return (uint16_t)endx_;
         if (i == 0xCF) return (uint16_t)(endx_ >> 16);
-        if (i == 0xD7) return reg_[0xD5] & 0x3F;   // SPUSTAT mirrors SPUCNT low bits
+        if (i == 0xD7) return (uint16_t)((reg_[0xD5] & 0x3F) | (irq_flag_ ? 0x40 : 0));   // SPUSTAT: SPUCNT low bits + IRQ flag
         return reg_[i];
     }
     void write16(uint32_t off, uint16_t v) {
@@ -92,8 +132,9 @@ private:
         case 0xC5: for (int b = 0; b < 8; ++b) if (v >> b & 1) key_on(16 + b); break;       // KON hi
         case 0xC6: for (int b = 0; b < 16; ++b) if (v >> b & 1) key_off(b); break;         // KOFF lo
         case 0xC7: for (int b = 0; b < 8; ++b) if (v >> b & 1) key_off(16 + b); break;     // KOFF hi
+        case 0xD5: if (!(v & 0x40)) irq_flag_ = false; break;                               // SPUCNT: IRQ off = acknowledge
         case 0xD3: xfer = (uint32_t)v * 8; break;                                           // transfer address
-        case 0xD4: ram[(xfer++) & 0x7FFFF] = (uint8_t)v; ram[(xfer++) & 0x7FFFF] = (uint8_t)(v >> 8); break;  // FIFO
+        case 0xD4: check_irq(xfer); ram[(xfer++) & 0x7FFFF] = (uint8_t)v; ram[(xfer++) & 0x7FFFF] = (uint8_t)(v >> 8); break;  // FIFO
         default: if (i < 0xC0 && (i & 7) == 7) voices_[i >> 3].repeat = (uint32_t)v * 8; break;   // repeat address
         }
     }
@@ -111,6 +152,7 @@ private:
     void decode_block(Voice& v, bool first) {
         (void)first;
         uint32_t a = v.addr & 0x7FFFF;
+        for (uint32_t k = 0; k < 16; k += 8) check_irq(a + k);   // block fetch touches the IRQ address?
         uint8_t hdr = ram[a]; v.flags = ram[(a + 1) & 0x7FFFF];
         int shift = hdr & 15, filter = std::min((hdr >> 4) & 7, 4);
         if (shift > 12) shift = 9;

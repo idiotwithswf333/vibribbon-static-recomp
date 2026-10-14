@@ -119,15 +119,34 @@ public:
         r[0] = 0;
         icount += cycles_per_instr;
         if (cd.tick(icount)) irq_set(2);
+        if ((spu_acc_ += cycles_per_instr) >= 768) { spu_acc_ -= 768; spu_cd_tick(); }
         if (ack_due && icount >= ack_due) { ack_due = 0; sio_irq = true; if (rd(&io[0x4A], 2) & 0x1000) irq_set(7); }
         if (icount >= next_vblank) { next_vblank += 677376; uint32_t st = rd(&io[0x70], 4) | 1u; wr(&io[0x70], st, 4); ++vblanks; }  // PAL 50 Hz
     }
-    uint64_t vblanks = 0, irqs_taken = 0;
+    static constexpr size_t kRing = 16384;          // interleaved stereo int16 slots of CD-DA samples awaiting mixing
+    std::vector<int16_t> ring_ = std::vector<int16_t>(kRing, 0); size_t ring_r_ = 0, ring_w_ = 0; uint32_t spu_acc_ = 0;
+    void spu_cd_tick() {   // one 44.1 kHz tick = 768 CPU cycles
+        int16_t s[2] = {0, 0};
+        cd.audio_samples(1, s);
+        spu.capture_tick(s[0], s[1]);
+        if (spu.take_irq()) irq_set(9);
+        ring_[ring_w_] = s[0]; ring_[ring_w_ + 1] = s[1]; ring_w_ = (ring_w_ + 2) % kRing;
+        if (ring_w_ == ring_r_) ring_r_ = (ring_r_ + 2) % kRing;   // drop the oldest sample if nobody is mixing
+    }
+    uint64_t vblanks = 0, irqs_taken = 0, dma4_reads = 0;
+    uint32_t dma4_last_madr = 0, dma4_last_words = 0, dma4_last_xfer = 0;
     // n stereo frames (interleaved int16) of everything audible: SPU voices + CD audio.
+    // Audio output for one video frame. The CD-DA stream, its SPU capture buffers and the SPU IRQ are advanced by
+    // the CPU loop (see spu_cd_tick), so they stay correct even if nobody calls this; it only mixes the voices with
+    // the CD samples queued by the loop. SPU voice envelopes still advance here, so call it once per video frame.
     void audio_frame(int n, int16_t* out) {
-        cd_buf_.resize((size_t)n * 2);
-        cd.audio_samples(n, cd_buf_.data());
+        cd_buf_.assign((size_t)n * 2, 0);
+        for (int i = 0; i < n && ring_r_ != ring_w_; ++i) {
+            cd_buf_[2 * i] = ring_[ring_r_]; cd_buf_[2 * i + 1] = ring_[ring_r_ + 1];
+            ring_r_ = (ring_r_ + 2) % kRing;
+        }
         spu.mix(n, out, cd_buf_.data());
+        if (spu.take_irq()) irq_set(9);
     }
     uint16_t pad1 = 0;   // controller 1, ACTIVE-HIGH (see pad_map.h); set by the frontend
     // Runs until the next vblank has occurred (or max instructions). Returns false if halted.
@@ -182,7 +201,7 @@ private:
             if (!(v & 2)) { sio_idx = 0; ack_due = 0; }                                       // DTR low: deselect
             return;
         }
-        if (a >= 0x1F801C00 && a < 0x1F801E00) { spu.write(a - 0x1F801C00, v, size); return; }
+        if (a >= 0x1F801C00 && a < 0x1F801E00) { spu.write(a - 0x1F801C00, v, size); if (spu.take_irq()) irq_set(9); return; }
         if (a == 0x1F801810) { gpu.gp0(v); return; }
         if (a == 0x1F801814) { gpu.gp1(v); return; }
         if (a == 0x1F801070) { wr(&io[off], rd(&io[off], 4) & v, 4); return; }  // I_STAT: write-0-to-ack
@@ -567,8 +586,13 @@ private:
             if (cd.dbg_log.size() < 60) { char b[64]; std::snprintf(b, sizeof b, "dma3 words=%u madr=%08X", words, madr); cd.dbg_log.push_back(b); }
             for (uint32_t i = 0; i < words; ++i) write(madr + 4 * i, cd.data_word(), 4);
             break;
-        case 4:   // RAM -> SPU RAM
+        case 4:   // RAM <-> SPU RAM
+            if (!(chcr & 1)) {
+                ++dma4_reads; dma4_last_madr = madr; dma4_last_words = words; dma4_last_xfer = spu.xfer;
+                for (uint32_t i = 0; i < words; ++i) write(madr + 4 * i, spu.dma_read_word(), 4);
+            }
             if (chcr & 1) for (uint32_t i = 0; i < words; ++i) spu.dma_write_word(read(madr + 4 * i, 4));
+            if (spu.take_irq()) irq_set(9);
             break;
         case 6: {  // ordering-table clear
             uint32_t n = blk ? blk : 0x10000;

@@ -4,6 +4,9 @@
 // CD-ROM, SPU (24 ADPCM voices + ADSR), CD-DA audio, DMA and interrupts emulated.
 #include <SDL.h>
 
+#include <algorithm>
+#include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -16,6 +19,7 @@
 #include "disc.h"
 #include <initializer_list>
 #include "pad_map.h"
+#include "runlog.h"
 
 namespace {
 
@@ -81,6 +85,32 @@ uint16_t read_keyboard() {
 }
 
 pad::TapFilter g_tap;   // see pad_map.h; F10 toggles it
+
+runlog::Log g_log;      // saved as vibribbon-log.txt next to the exe (see runlog.h)
+
+void crash_handler(int sig) {   // best effort: note the crash and save what we have
+    g_log.note("CRASH: the app received signal %d", sig);
+    g_log.save();
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+
+std::string pad_names(uint16_t w) {
+    if (!w) return "(all released)";
+    static const struct { uint16_t bit; const char* name; } kNames[] = {
+        {pad::UP, "UP"}, {pad::DOWN, "DOWN"}, {pad::LEFT, "LEFT"}, {pad::RIGHT, "RIGHT"}, {pad::CROSS, "CROSS"},
+        {pad::CIRCLE, "CIRCLE"}, {pad::SQUARE, "SQUARE"}, {pad::TRIANGLE, "TRIANGLE"}, {pad::L1, "L1"}, {pad::R1, "R1"},
+        {pad::L2, "L2"}, {pad::R2, "R2"}, {pad::START, "START"}, {pad::SELECT, "SELECT"}};
+    std::string r;
+    for (auto& n : kNames) if (w & n.bit) { if (!r.empty()) r += "+"; r += n.name; }
+    return r;
+}
+
+uint64_t hash_pixels(const std::vector<uint32_t>& p) {   // cheap fingerprint of the picture, to spot a frozen screen
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < p.size(); i += 13) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
 
 // One running game. The disc image must outlive the CPU that reads from it.
 struct Emulator {
@@ -161,23 +191,37 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
+    {
+        std::string dir = ".";
+        if (char* base = SDL_GetBasePath()) { dir = base; SDL_free(base); }
+        if (!g_log.open(dir) && !g_log.open(std::filesystem::current_path().string()))
+            std::fprintf(stderr, "Could not create vibribbon-log.txt (folder not writable)\n");
+        std::signal(SIGSEGV, crash_handler); std::signal(SIGABRT, crash_handler); std::signal(SIGFPE, crash_handler);
+        SDL_version v; SDL_GetVersion(&v);
+        g_log.note("App started. SDL %d.%d.%d, video driver: %s", v.major, v.minor, v.patch, SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?");
+        g_log.note("Log file: %s", g_log.path().c_str());
+        for (int i = 1; i < argc; ++i) g_log.note("Command line argument %d: %s", i, argv[i]);
+    }
     SDL_Window* win = SDL_CreateWindow("Vib-Ribbon - drop vibribbon.cue here", SDL_WINDOWPOS_CENTERED,
                                        SDL_WINDOWPOS_CENTERED, 960, 720, SDL_WINDOW_RESIZABLE);
     SDL_Renderer* ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED) : nullptr;
     if (!win || !ren) {
         std::fprintf(stderr, "Window/renderer failed: %s\n", SDL_GetError());
+        g_log.note("ERROR: window/renderer failed: %s", SDL_GetError());
         return 1;
     }
+    { SDL_RendererInfo ri; if (SDL_GetRendererInfo(ren, &ri) == 0) g_log.note("Renderer: %s", ri.name); }
     SDL_RenderSetLogicalSize(ren, 640, 480);   // always shown 4:3, like a TV
     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
     open_first_controller();
+    g_log.note("Controller: %s", g_pad ? SDL_GameControllerName(g_pad) : "none connected (keyboard only)");
 
     // Audio: 44.1 kHz stereo, fed one video frame (882 sample frames at 50 Hz) at a time.
     SDL_AudioSpec want{}, have{};
     want.freq = 44100; want.format = AUDIO_S16SYS; want.channels = 2; want.samples = 1024;
     SDL_AudioDeviceID audio = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
-    if (audio) SDL_PauseAudioDevice(audio, 0);
-    else std::fprintf(stderr, "Audio unavailable: %s\n", SDL_GetError());
+    if (audio) { SDL_PauseAudioDevice(audio, 0); g_log.note("Audio: opened %d Hz, %d channels, driver %s", have.freq, (int)have.channels, SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?"); }
+    else { std::fprintf(stderr, "Audio unavailable: %s\n", SDL_GetError()); g_log.note("WARNING: no audio device (%s). The game still runs; sound is silent.", SDL_GetError()); }
     constexpr int kAudioFrames = 44100 / 50;
     std::vector<int16_t> audio_buf((size_t)kAudioFrames * 2);
 
@@ -188,11 +232,36 @@ int main(int argc, char** argv) {
     bool fullscreen = false;
     uint32_t frames = 0, last_title = SDL_GetTicks();
 
+    // Run statistics for the log.
+    uint32_t hb_last = SDL_GetTicks(), hb_frames = 0, total_frames = 0, slow_frames = 0, max_frame_ms = 0;
+    uint32_t pad_changes = 0, stall_warnings = 0, hb_count = 0;
+    double fps_min = 1e9, fps_max = 0;
+    uint64_t last_hash = 0, last_vblanks = 0; int same_hash = 0;
+    std::string last_halt = "no", last_disc = "(none)";
+    uint16_t cur_pad = 0;
+    auto update_summary = [&](const char* how) {
+        char b[900]; double run = g_log.elapsed();
+        std::snprintf(b, sizeof b,
+            "Run time: %.1f s (%s)\nFrames shown: %u (average %.1f fps, target 50)\nHeartbeat fps: min %.1f, max %.1f\n"
+            "Slow frames (over 40 ms): %u, worst frame: %u ms\nButton changes: %u\nScreen-unchanged warnings: %u\n"
+            "Disc: %s\nBIOS: %s\nCPU stopped: %s\nLast CPU position: %s\nD-pad tap filter: %s",
+            run, how, total_frames, run > 0 ? total_frames / run : 0.0, hb_count ? fps_min : 0.0, fps_max, slow_frames, max_frame_ms,
+            pad_changes, stall_warnings, last_disc.c_str(), g_bios.empty() ? "none (controller will not work)" : g_bios.c_str(),
+            last_halt.c_str(),
+            emu.cpu ? ([&] { char t[16]; std::snprintf(t, sizeof t, "%08X", emu.cpu->pc); return std::string(t); })().c_str() : "n/a",
+            g_tap.enabled ? "on" : "off");
+        g_log.set_summary(b);
+    };
+
     std::string last_cue;
     uint32_t warn_until = 0;
     auto start = [&](const std::string& cue) {
-        last_cue = cue;
+        last_cue = cue; last_disc = cue;
+        g_log.note("Loading disc: %s", cue.c_str());
         std::string msg = boot_disc(cue, emu);
+        g_log.note("BIOS in use: %s", g_bios.empty() ? "none found" : g_bios.c_str());
+        g_log.note("Boot result: %s", msg.empty() ? "started OK" : msg.c_str());
+        last_halt = "no"; hb_last = SDL_GetTicks(); hb_frames = 0; same_hash = 0; last_hash = 0; last_vblanks = 0;
         if (msg.empty()) SDL_SetWindowTitle(win, "Vib-Ribbon");
         else {
             bool warn = msg[0] == '!';
@@ -207,9 +276,10 @@ int main(int argc, char** argv) {
     for (bool running = true; running;) {
         uint32_t frame_start = SDL_GetTicks();
         for (SDL_Event e; SDL_PollEvent(&e);) {
-            if (e.type == SDL_QUIT) running = false;
+            if (e.type == SDL_QUIT) { running = false; g_log.note("Window closed by the user"); }
             if (e.type == SDL_DROPFILE) {
                 std::filesystem::path dropped = e.drop.file;
+                g_log.note("File dropped on the window: %s", e.drop.file);
                 if (looks_like_bios(dropped)) {   // a BIOS dropped on the window: remember it next to the exe and restart
                     g_bios = dropped.string();
                     if (char* base = SDL_GetBasePath()) {
@@ -221,20 +291,23 @@ int main(int argc, char** argv) {
                 } else start(e.drop.file);
                 SDL_free(e.drop.file);
             }
-            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) { running = false; g_log.note("Esc pressed: closing"); }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F10) {
                 g_tap.enabled = !g_tap.enabled;
                 std::fprintf(stderr, "D-pad tap filter %s\n", g_tap.enabled ? "ON" : "OFF");
+                g_log.note("D-pad tap filter turned %s (F10)", g_tap.enabled ? "ON" : "OFF");
             }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F11) {
                 fullscreen = !fullscreen;
+                g_log.note("Fullscreen %s (F11)", fullscreen ? "on" : "off");
                 SDL_SetWindowFullscreen(win, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
             }
-            if (e.type == SDL_CONTROLLERDEVICEADDED) open_first_controller();
+            if (e.type == SDL_CONTROLLERDEVICEADDED) { open_first_controller(); g_log.note("Controller connected: %s", g_pad ? SDL_GameControllerName(g_pad) : "?"); }
             if (e.type == SDL_CONTROLLERDEVICEREMOVED && g_pad &&
                 e.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pad))) {
                 SDL_GameControllerClose(g_pad);
                 g_pad = nullptr;
+                g_log.note("Controller disconnected");
                 open_first_controller();
             }
         }
@@ -244,11 +317,18 @@ int main(int argc, char** argv) {
         if (emu.cpu) {
             emu.cpu->pad1 = g_tap.apply(pad::to_ps1(read_controller()) | read_keyboard());
             static uint16_t last_pad = 0;   // log pad changes so you can see the keyboard is being read
-            if (emu.cpu->pad1 != last_pad) { last_pad = emu.cpu->pad1; std::fprintf(stderr, "pad: %04X\n", last_pad); }
+            if (emu.cpu->pad1 != last_pad) {
+                last_pad = emu.cpu->pad1; cur_pad = last_pad; ++pad_changes;
+                std::fprintf(stderr, "pad: %04X\n", last_pad);
+                g_log.noisy("Buttons sent to the game: %s", pad_names(last_pad).c_str());
+            }
             if (!emu.cpu->run_frame() && emu.cpu->halted) {
                 std::string m = "CPU stopped: " + emu.cpu->halt_reason;
                 SDL_SetWindowTitle(win, m.c_str());
                 std::fprintf(stderr, "%s\n", m.c_str());
+                g_log.note("ERROR: %s (CPU position %08X)", m.c_str(), emu.cpu->pc);
+                last_halt = emu.cpu->halt_reason + " (at " + [&] { char t[16]; std::snprintf(t, sizeof t, "%08X", emu.cpu->pc); return std::string(t); }() + ")";
+                update_summary("CPU stopped"); g_log.save();
                 emu.cpu.reset();   // back to waiting for a disc
                 if (audio) SDL_ClearQueuedAudio(audio);
             } else {
@@ -268,7 +348,7 @@ int main(int argc, char** argv) {
                 }
                 SDL_UpdateTexture(tex, nullptr, pixels.data(), w * 4);
                 SDL_RenderCopy(ren, tex, nullptr, nullptr);
-                ++frames;
+                ++frames; ++hb_frames; ++total_frames;
             }
         }
         SDL_RenderPresent(ren);
@@ -280,11 +360,40 @@ int main(int argc, char** argv) {
             SDL_SetWindowTitle(win, t);
             frames = 0; last_title = now;
         }
+        if (emu.cpu && now - hb_last >= 5000) {   // heartbeat every 5 s: how the emulation is doing
+            double secs = (now - hb_last) / 1000.0, fps = hb_frames / secs;
+            fps_min = std::min(fps_min, fps); fps_max = std::max(fps_max, fps); ++hb_count;
+            auto& c = *emu.cpu;
+            g_log.note("Heartbeat: %.1f fps (target 50) | game frames +%llu | CPU at %08X | CD %s%s, %llu sectors read, %llu commands | SPU key-ons %llu, SPU read-backs %llu, interrupts %llu | buttons: %s",
+                       fps, (unsigned long long)(c.vblanks - last_vblanks), c.pc, c.cd.playing ? "playing audio" : "not playing audio",
+                       c.cd.muted ? " (muted)" : "", (unsigned long long)c.cd.sectors_read, (unsigned long long)c.cd.cmds,
+                       (unsigned long long)c.spu.key_ons, (unsigned long long)c.dma4_reads, (unsigned long long)c.irqs_taken, pad_names(cur_pad).c_str());
+            if (fps < 45.0 && hb_frames > 0) g_log.note("WARNING: running slow (%.1f fps). The game will play too slowly.", fps);
+            if (c.vblanks == last_vblanks) g_log.note("WARNING: the game did not advance a single frame in %.0f s", secs);
+            last_vblanks = c.vblanks;
+            uint64_t h = hash_pixels(pixels);
+            if (h == last_hash) {
+                ++same_hash;
+                if (same_hash == 3 || same_hash == 12 || same_hash == 60) {
+                    ++stall_warnings;
+                    g_log.note("WARNING: the picture has not changed for %d s (CPU at %08X). Normal on a still screen, but if you expected movement the game may be stuck.", same_hash * 5, c.pc);
+                }
+            } else {
+                if (same_hash >= 3) g_log.note("Picture is changing again after %d s of no change", same_hash * 5);
+                same_hash = 0; last_hash = h;
+            }
+            update_summary("still running"); g_log.save();
+            hb_last = now; hb_frames = 0;
+        }
         // Hold the PAL 50 Hz pace; if emulation is slower than that we simply run flat out.
         uint32_t spent = SDL_GetTicks() - frame_start;
+        if (emu.cpu && spent > 40) { ++slow_frames; max_frame_ms = std::max(max_frame_ms, spent); }
         if (emu.cpu && spent < 20) SDL_Delay(20 - spent);
         else if (!emu.cpu) SDL_Delay(16);
     }
+    g_log.note("Shutting down after %u frames", total_frames);
+    update_summary("closed normally");
+    g_log.save();
     if (tex) SDL_DestroyTexture(tex);
     if (g_pad) SDL_GameControllerClose(g_pad);
     if (audio) SDL_CloseAudioDevice(audio);

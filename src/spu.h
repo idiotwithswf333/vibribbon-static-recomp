@@ -18,6 +18,11 @@ public:
     // SPU IRQ (IRQ9): raised when a voice block fetch, a FIFO/DMA write, or the capture-buffer write pointer touches
     // the sound-RAM address in the IRQ-address register (0x1A4) while SPUCNT bit 6 is set. The flag shows in
     // SPUSTAT bit 6 and is cleared by writing SPUCNT with bit 6 = 0. The CPU polls take_irq() and sets I_STAT bit 9.
+    // True when the game itself routes CD audio through the SPU (CD input enabled and volume non-zero).
+    bool cd_input_audible() const { return (reg_[0xD5] & 1) && (reg_[0xD8] || reg_[0xD9]); }
+    uint16_t cd_vol_l() const { return reg_[0xD8]; }
+    uint16_t cd_vol_r() const { return reg_[0xD9]; }
+    uint16_t spucnt() const { return reg_[0xD5]; }
     bool take_irq() { bool f = irq_fired_; irq_fired_ = false; return f; }
 
     uint32_t read(uint32_t off, int size) const {

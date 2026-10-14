@@ -4,13 +4,16 @@
 // Every frame also calls audio_frame(): the SPU, SPU IRQ and CD-DA clocks only advance there.
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <sstream>
 #include <string>
 #include "../src/cpu.h"
 #include "../src/disc.h"
 #include "../src/pad_map.h"
 static cpu::Cpu* g; static pad::TapFilter tf; static uint16_t held = 0; static std::vector<int16_t> abuf(882 * 2);
-static void run(int n) { for (int i = 0; i < n && !g->halted; ++i) { g->pad1 = tf.apply(held); g->run_frame(); g->audio_frame(882, abuf.data()); } }
+static double g_sumsq = 0; static long g_samples = 0; static int g_peak = 0;
+static void run(int n) { for (int i = 0; i < n && !g->halted; ++i) { g->pad1 = tf.apply(held); g->run_frame(); g->audio_frame(882, abuf.data());
+    for (int k = 0; k < 882 * 2; ++k) { int v = abuf[k]; g_sumsq += (double)v * v; ++g_samples; if (std::abs(v) > g_peak) g_peak = std::abs(v); } } }
 static void shot(const std::string& fn) {
     std::vector<uint32_t> px; int w = 0, h = 0; g->gpu.display(px, w, h);
     FILE* o = std::fopen(fn.c_str(), "wb"); std::fprintf(o, "P6\n%d %d\n255\n", w, h);
@@ -32,12 +35,18 @@ int main(int, char** argv) {
         if (tok == "c") { static size_t last = 0; auto& h = c.cd.cmd_hist; int cnt = 0, getlocp = 0;
             for (size_t i = last; i < h.size(); ++i) { if (h[i].find("cmd 11") != std::string::npos) { ++getlocp; continue; } if (cnt++ < 60) std::printf("   %s\n", h[i].c_str()); }
             std::printf("   (+ %d GetlocP)\n", getlocp); last = h.size(); }
+        else if (tok == "a0") c.music_assist = false;
+        else if (tok == "a1") c.music_assist = true;
         else if (tok[0] == 'w') run(std::atoi(tok.c_str() + 1));
         else if (tok[0] == 'p') { char nm[256]; std::snprintf(nm, sizeof nm, "%s_%02d.ppm", argv[3], n); shot(nm);
             std::printf("shot %02d: pc=%08X halted=%d %s cd.playing=%d muted=%d lba=%u sectors=%llu\n", n, c.pc, c.halted, c.halt_reason.c_str(), (int)c.cd.playing, (int)c.cd.muted, c.cd.dbg_loc(), (unsigned long long)c.cd.sectors_read); std::printf("         spu: key_ons=%llu dma4_reads=%llu last read madr=%08X words=%u spu_xfer=%05X irq_addr=%04X cnt=%04X\n", (unsigned long long)c.spu.key_ons, (unsigned long long)c.dma4_reads, c.dma4_last_madr, c.dma4_last_words, c.dma4_last_xfer, (unsigned)c.read(0x1F801DA4,2), (unsigned)c.read(0x1F801DAA,2));
             { long sumcap = 0, sumdst = 0; for (int k = 0; k < 0x800; k += 2) sumcap += std::abs((int16_t)(c.spu.ram[k] | c.spu.ram[k+1] << 8));
               for (int k = 0; k < 1536; k += 2) sumdst += std::abs((int16_t)(c.ram[(c.dma4_last_madr & 0x1FFFFF) + k] | c.ram[(c.dma4_last_madr & 0x1FFFFF) + k + 1] << 8));
               std::printf("         SPU cd-vol regs 1B0=%04X 1B2=%04X mainvol=%04X/%04X | capture(CD L+R) abs-sum=%ld | last DMA dest abs-sum=%ld\n", (unsigned)c.read(0x1F801DB0,2), (unsigned)c.read(0x1F801DB2,2), (unsigned)c.read(0x1F801D80,2), (unsigned)c.read(0x1F801D82,2), sumcap, sumdst); }
+            { int act = 0; for (int v = 0; v < 24; ++v) if (c.read(0x1F801C0C + v * 16, 2)) ++act;
+              std::printf("         AUDIO OUT since last shot: rms=%.0f peak=%d | active voices=%d | SPUCNT=%04X mainvol=%04X/%04X cdvol(SPU)=%04X/%04X | cd.muted=%d playing=%d | assist_active=%d\n",
+                  g_samples ? std::sqrt(g_sumsq / g_samples) : 0.0, g_peak, act, (unsigned)c.read(0x1F801DAA,2), (unsigned)c.read(0x1F801D80,2), (unsigned)c.read(0x1F801D82,2), (unsigned)c.read(0x1F801DB0,2), (unsigned)c.read(0x1F801DB2,2), (int)c.cd.muted, (int)c.cd.playing, (int)c.assist_active);
+              g_sumsq = 0; g_samples = 0; g_peak = 0; }
             ++n; }
         else if (b) { held = b; run(6); held = 0; run(10); }
     }

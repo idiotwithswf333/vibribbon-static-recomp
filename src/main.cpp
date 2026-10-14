@@ -292,6 +292,11 @@ int main(int argc, char** argv) {
                 SDL_free(e.drop.file);
             }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) { running = false; g_log.note("Esc pressed: closing"); }
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F9 && emu.cpu) {
+                emu.cpu->music_assist = !emu.cpu->music_assist;
+                std::fprintf(stderr, "Music assist %s\n", emu.cpu->music_assist ? "ON" : "OFF");
+                g_log.note("Music assist turned %s (F9)", emu.cpu->music_assist ? "ON" : "OFF");
+            }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F10) {
                 g_tap.enabled = !g_tap.enabled;
                 std::fprintf(stderr, "D-pad tap filter %s\n", g_tap.enabled ? "ON" : "OFF");
@@ -364,10 +369,12 @@ int main(int argc, char** argv) {
             double secs = (now - hb_last) / 1000.0, fps = hb_frames / secs;
             fps_min = std::min(fps_min, fps); fps_max = std::max(fps_max, fps); ++hb_count;
             auto& c = *emu.cpu;
-            g_log.note("Heartbeat: %.1f fps (target 50) | game frames +%llu | CPU at %08X | CD %s%s, %llu sectors read, %llu commands | SPU key-ons %llu, SPU read-backs %llu, interrupts %llu | buttons: %s",
+            g_log.note("Heartbeat: %.1f fps (target 50) | game frames +%llu | CPU at %08X | CD %s%s, %llu sectors read, %llu commands | SPU key-ons %llu, SPU read-backs %llu, interrupts %llu | SPU CD input: %s (vol %04X/%04X), music assist: %s | buttons: %s",
                        fps, (unsigned long long)(c.vblanks - last_vblanks), c.pc, c.cd.playing ? "playing audio" : "not playing audio",
                        c.cd.muted ? " (muted)" : "", (unsigned long long)c.cd.sectors_read, (unsigned long long)c.cd.cmds,
-                       (unsigned long long)c.spu.key_ons, (unsigned long long)c.dma4_reads, (unsigned long long)c.irqs_taken, pad_names(cur_pad).c_str());
+                       (unsigned long long)c.spu.key_ons, (unsigned long long)c.dma4_reads, (unsigned long long)c.irqs_taken,
+                       c.spu.cd_input_audible() ? "on" : "off", c.spu.cd_vol_l(), c.spu.cd_vol_r(),
+                       !c.music_assist ? "disabled" : c.assist_active ? "ACTIVE (CD mixed in directly)" : "idle", pad_names(cur_pad).c_str());
             if (fps < 45.0 && hb_frames > 0) g_log.note("WARNING: running slow (%.1f fps). The game will play too slowly.", fps);
             if (c.vblanks == last_vblanks) g_log.note("WARNING: the game did not advance a single frame in %.0f s", secs);
             last_vblanks = c.vblanks;

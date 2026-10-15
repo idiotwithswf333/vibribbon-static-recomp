@@ -20,9 +20,12 @@ public:
     // SPUSTAT bit 6 and is cleared by writing SPUCNT with bit 6 = 0. The CPU polls take_irq() and sets I_STAT bit 9.
     // True when the game itself routes CD audio through the SPU (CD input enabled and volume non-zero).
     bool cd_input_audible() const { return (reg_[0xD5] & 1) && (reg_[0xD8] || reg_[0xD9]); }
+    uint16_t rvb_vol_l() const { return reg_[0xC2]; }   // reverb output volume (the game's music on/off switch)
+    uint16_t rvb_vol_r() const { return reg_[0xC3]; }
     uint16_t cd_vol_l() const { return reg_[0xD8]; }
     uint16_t cd_vol_r() const { return reg_[0xD9]; }
     uint16_t spucnt() const { return reg_[0xD5]; }
+    uint64_t fifo_writes = 0; uint32_t fifo_min = ~0u, fifo_max = 0;   // diagnostics: CPU (PIO) writes to the SPU data port
     bool take_irq() { bool f = irq_fired_; irq_fired_ = false; return f; }
 
     uint32_t read(uint32_t off, int size) const {
@@ -60,7 +63,10 @@ public:
         put16(0xC00 + o, voices_[3].phase != Off ? voice_out_[3] : 0);
         if ((cnt & 0x40) && !irq_flag_) for (uint32_t base = 0; base < 0x1000; base += 0x400) check_irq(base + o);
         cap_idx_ = (cap_idx_ + 1) & 0x1FF;
+        reverb_tick();
     }
+    // Reverb output for the current 44.1 kHz tick, already scaled by vLOUT/vROUT (added to the mix before master volume).
+    void rvb_out(int& l, int& r) const { l = rvb_out_l_; r = rvb_out_r_; }
     uint32_t dma_read_word() {   // SPU RAM -> RAM via DMA channel 4
         check_irq(xfer); check_irq(xfer + 2);
         uint32_t w = 0;
@@ -69,7 +75,7 @@ public:
     }
 
     // Produce n stereo frames. cd may be null, or n interleaved stereo samples of CD audio.
-    void mix(int n, int16_t* out, const int16_t* cd) {
+    void mix(int n, int16_t* out, const int16_t* cd, const int16_t* rvb = nullptr) {
         uint16_t cnt = reg_[0xD5];   // SPUCNT @ 0x1AA
         bool enabled = (cnt & 0x8000) != 0, unmuted = (cnt & 0x4000) != 0, cd_on = (cnt & 1) != 0;
         int mvl = vol(reg_[0xC0]), mvr = vol(reg_[0xC1]);
@@ -87,6 +93,7 @@ public:
                     r += (s * vol(reg_[v * 8 + 1])) >> 15;
                 }
                 if (cd && cd_on) { l += (cd[2 * i] * cvl) >> 15; r += (cd[2 * i + 1] * cvr) >> 15; }
+                if (rvb) { l += rvb[2 * i]; r += rvb[2 * i + 1]; }   // reverb unit output (see reverb_tick)
             }
             l = (l * mvl) >> 15; r = (r * mvr) >> 15;
             if (!unmuted) l = r = 0;
@@ -113,6 +120,66 @@ private:
     int16_t voice_out_[24] = {};
     uint32_t cap_idx_ = 0;   // capture-buffer write pointer (0..511 samples; 4 buffers of 0x400 bytes at 0x000..0xFFF)
 
+    // ---- Reverb unit (psx-spx "SPU Reverb Formula") --------------------------------------------------------------
+    // Runs every 2nd 44.1 kHz tick from capture_tick(), i.e. in CPU time, so it stays in step with the DMA writes the
+    // game makes into the reverb work area. Vib-Ribbon uses that tiny ring (0x7FE00..0x7FFFF) as a PCM player for the
+    // delayed music. Reverb INPUT from voices (EON) is not fed in yet; only the buffer-driven output is produced.
+    uint32_t rvb_addr_ = 0; int rvb_phase_ = 0;
+    int rvb_prev_l_ = 0, rvb_prev_r_ = 0, rvb_cur_l_ = 0, rvb_cur_r_ = 0, rvb_out_l_ = 0, rvb_out_r_ = 0;
+
+    static int mul15(int a, int b) { return (int)(((int64_t)a * b) >> 15); }
+    static int sat(int v) { return v > 32767 ? 32767 : v < -32768 ? -32768 : v; }
+    uint32_t rvb_resolve(int64_t off) const {
+        int64_t base = (int64_t)reg_[0xD1] * 8, size = 0x80000 - base;
+        int64_t a = (int64_t)rvb_addr_ + off;
+        if (size < 2) return (uint32_t)(a & 0x7FFFE);
+        a = base + (((a - base) % size) + size) % size;
+        return (uint32_t)a & ~1u;
+    }
+    int rvb_rd(int64_t off) const { uint32_t a = rvb_resolve(off); return (int16_t)(ram[a] | ram[a + 1] << 8); }
+    void rvb_wr(int64_t off, int v) { if (!(reg_[0xD5] & 0x80)) return; uint32_t a = rvb_resolve(off); put16(a, sat(v)); }   // writes need SPUCNT bit 7
+
+    void reverb_step() {
+        auto S = [&](int i) { return (int)(int16_t)reg_[i]; };
+        auto M = [&](int i) { return (int64_t)reg_[i] * 8; };   // buffer offsets are in 8-byte units
+        const int vIIR = S(0xE2), vC1 = S(0xE3), vC2 = S(0xE4), vC3 = S(0xE5), vC4 = S(0xE6), vWALL = S(0xE7), vA1 = S(0xE8), vA2 = S(0xE9);
+        const int64_t dA1 = M(0xE0), dA2 = M(0xE1);
+        const int Lin = 0, Rin = 0;   // TODO: reverb input from voices with EON set
+        // Same-side and different-side reflections (all-pass-like IIR into the buffer)
+        auto iir = [&](int in, int64_t dst, int64_t dsrc) {
+            int old = rvb_rd(dst - 2);
+            int x = sat(in + mul15(rvb_rd(dsrc), vWALL) - old);
+            rvb_wr(dst, sat(mul15(x, vIIR) + old));
+        };
+        iir(Lin, M(0xEA), M(0xF0));   // [mLSAME]  from [dLSAME]
+        iir(Rin, M(0xEB), M(0xF1));   // [mRSAME]  from [dRSAME]
+        iir(Lin, M(0xF2), M(0xF9));   // [mLDIFF]  from [dRDIFF]
+        iir(Rin, M(0xF3), M(0xF8));   // [mRDIFF]  from [dLDIFF]
+        // Early echo (comb filter)
+        int Lout = sat(mul15(vC1, rvb_rd(M(0xEC))) + mul15(vC2, rvb_rd(M(0xEE))) + mul15(vC3, rvb_rd(M(0xF4))) + mul15(vC4, rvb_rd(M(0xF6))));
+        int Rout = sat(mul15(vC1, rvb_rd(M(0xED))) + mul15(vC2, rvb_rd(M(0xEF))) + mul15(vC3, rvb_rd(M(0xF5))) + mul15(vC4, rvb_rd(M(0xF7))));
+        // Late reverb: two all-pass filters
+        auto apf = [&](int v, int vA, int64_t m, int64_t d) {
+            int t = rvb_rd(m - d);
+            v = sat(v - mul15(vA, t));
+            rvb_wr(m, v);
+            return sat(mul15(v, vA) + t);
+        };
+        Lout = apf(Lout, vA1, M(0xFA), dA1); Rout = apf(Rout, vA1, M(0xFB), dA1);
+        Lout = apf(Lout, vA2, M(0xFC), dA2); Rout = apf(Rout, vA2, M(0xFD), dA2);
+        rvb_prev_l_ = rvb_cur_l_; rvb_prev_r_ = rvb_cur_r_;
+        rvb_cur_l_ = Lout; rvb_cur_r_ = Rout;
+        // advance the buffer address, wrapping inside [mBASE, 0x7FFFE]
+        uint32_t base = (uint32_t)reg_[0xD1] * 8;
+        rvb_addr_ += 2; if (rvb_addr_ >= 0x80000 || rvb_addr_ < base) rvb_addr_ = base;
+    }
+    void reverb_tick() {
+        int l, r;
+        if ((rvb_phase_++ & 1) == 0) { reverb_step(); l = rvb_prev_l_; r = rvb_prev_r_; }          // new 22 kHz sample
+        else { l = (rvb_prev_l_ + rvb_cur_l_) >> 1; r = (rvb_prev_r_ + rvb_cur_r_) >> 1; }          // linear upsample
+        rvb_out_l_ = mul15(l, (int16_t)reg_[0xC2]); rvb_out_r_ = mul15(r, (int16_t)reg_[0xC3]);     // vLOUT / vROUT
+    }
+
     void check_irq(uint32_t byte_addr) {
         if (!(reg_[0xD5] & 0x8000) || !(reg_[0xD5] & 0x40)) return;   // SPU enabled and IRQ enabled
         if (((byte_addr & 0x7FFFF) >> 3) != ((uint32_t)reg_[0xD2] >> 0)) return;   // IRQ address reg is in 8-byte units
@@ -138,8 +205,9 @@ private:
         case 0xC6: for (int b = 0; b < 16; ++b) if (v >> b & 1) key_off(b); break;         // KOFF lo
         case 0xC7: for (int b = 0; b < 8; ++b) if (v >> b & 1) key_off(16 + b); break;     // KOFF hi
         case 0xD5: if (!(v & 0x40)) irq_flag_ = false; break;                               // SPUCNT: IRQ off = acknowledge
+        case 0xD1: rvb_addr_ = (uint32_t)v * 8; break;                                      // reverb work area start (mBASE)
         case 0xD3: xfer = (uint32_t)v * 8; break;                                           // transfer address
-        case 0xD4: check_irq(xfer); ram[(xfer++) & 0x7FFFF] = (uint8_t)v; ram[(xfer++) & 0x7FFFF] = (uint8_t)(v >> 8); break;  // FIFO
+        case 0xD4: ++fifo_writes; if (xfer < fifo_min) fifo_min = xfer; if (xfer > fifo_max) fifo_max = xfer; check_irq(xfer); ram[(xfer++) & 0x7FFFF] = (uint8_t)v; ram[(xfer++) & 0x7FFFF] = (uint8_t)(v >> 8); break;  // FIFO
         default: if (i < 0xC0 && (i & 7) == 7) voices_[i >> 3].repeat = (uint32_t)v * 8; break;   // repeat address
         }
     }

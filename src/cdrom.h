@@ -22,6 +22,7 @@ public:
     bool playing = false, muted = false;
     uint32_t dbg_loc() const { return loc; }
     uint32_t dbg_da_lba() const { return da_lba; }
+    int dbg_cdvol(int i) const { return cdvol[i]; }
     uint8_t dbg_mode() const { return mode; }
     std::vector<std::string> cmd_hist;   // every command with timestamp, for diagnostics
     std::vector<uint32_t> setloc_hist;   // every Setloc target (LBA), for diagnostics

@@ -239,7 +239,6 @@ int main(int argc, char** argv) {
     uint64_t last_hash = 0, last_vblanks = 0; int same_hash = 0;
     std::string last_halt = "no", last_disc = "(none)";
     uint16_t cur_pad = 0;
-    bool assist_was_active = false;
     auto update_summary = [&](const char* how) {
         char b[900]; double run = g_log.elapsed();
         std::snprintf(b, sizeof b,
@@ -262,7 +261,7 @@ int main(int argc, char** argv) {
         std::string msg = boot_disc(cue, emu);
         g_log.note("BIOS in use: %s", g_bios.empty() ? "none found" : g_bios.c_str());
         g_log.note("Boot result: %s", msg.empty() ? "started OK" : msg.c_str());
-        last_halt = "no"; assist_was_active = false; hb_last = SDL_GetTicks(); hb_frames = 0; same_hash = 0; last_hash = 0; last_vblanks = 0;
+        last_halt = "no"; hb_last = SDL_GetTicks(); hb_frames = 0; same_hash = 0; last_hash = 0; last_vblanks = 0;
         if (msg.empty()) SDL_SetWindowTitle(win, "Vib-Ribbon");
         else {
             bool warn = msg[0] == '!';
@@ -293,11 +292,6 @@ int main(int argc, char** argv) {
                 SDL_free(e.drop.file);
             }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) { running = false; g_log.note("Esc pressed: closing"); }
-            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F9 && emu.cpu) {
-                emu.cpu->music_assist = !emu.cpu->music_assist;
-                std::fprintf(stderr, "Music assist %s\n", emu.cpu->music_assist ? "ON" : "OFF");
-                g_log.note("Music assist turned %s (F9)", emu.cpu->music_assist ? "ON" : "OFF");
-            }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F10) {
                 g_tap.enabled = !g_tap.enabled;
                 std::fprintf(stderr, "D-pad tap filter %s\n", g_tap.enabled ? "ON" : "OFF");
@@ -355,10 +349,6 @@ int main(int argc, char** argv) {
                 SDL_UpdateTexture(tex, nullptr, pixels.data(), w * 4);
                 SDL_RenderCopy(ren, tex, nullptr, nullptr);
                 ++frames; ++hb_frames; ++total_frames;
-                if (emu.cpu->assist_active != assist_was_active) {   // log when the CD music is (un)mixed in directly
-                    assist_was_active = emu.cpu->assist_active;
-                    g_log.note(assist_was_active ? "Music assist ENGAGED: CD audio is being mixed straight into the output" : "Music assist released (CD stopped/muted, or the game is routing it itself)");
-                }
             }
         }
         SDL_RenderPresent(ren);
@@ -366,8 +356,7 @@ int main(int argc, char** argv) {
         uint32_t now = SDL_GetTicks();
         if (emu.cpu && now - last_title >= 1000 && now > warn_until) {   // FPS in the title bar
             char t[160];
-            std::snprintf(t, sizeof t, "Vib-Ribbon - %u fps | F9 music assist: %s%s | F10 tap filter: %s", frames,
-                          emu.cpu->music_assist ? "ON" : "OFF", emu.cpu->assist_active ? " (playing)" : "", g_tap.enabled ? "ON" : "OFF");
+            std::snprintf(t, sizeof t, "Vib-Ribbon - %u fps (target 50) | F10 tap filter: %s", frames, g_tap.enabled ? "ON" : "OFF");
             SDL_SetWindowTitle(win, t);
             frames = 0; last_title = now;
         }
@@ -375,12 +364,12 @@ int main(int argc, char** argv) {
             double secs = (now - hb_last) / 1000.0, fps = hb_frames / secs;
             fps_min = std::min(fps_min, fps); fps_max = std::max(fps_max, fps); ++hb_count;
             auto& c = *emu.cpu;
-            g_log.note("Heartbeat: %.1f fps (target 50) | game frames +%llu | CPU at %08X | CD %s%s, %llu sectors read, %llu commands | SPU key-ons %llu, SPU read-backs %llu, interrupts %llu | SPU CD input: %s (vol %04X/%04X), music assist: %s | buttons: %s",
+            g_log.note("Heartbeat: %.1f fps (target 50) | game frames +%llu | CPU at %08X | CD %s%s, %llu sectors read, %llu commands | SPU key-ons %llu, SPU read-backs %llu, interrupts %llu | SPU CD input: %s | music (reverb) volume %04X/%04X%s | buttons: %s",
                        fps, (unsigned long long)(c.vblanks - last_vblanks), c.pc, c.cd.playing ? "playing audio" : "not playing audio",
                        c.cd.muted ? " (muted)" : "", (unsigned long long)c.cd.sectors_read, (unsigned long long)c.cd.cmds,
                        (unsigned long long)c.spu.key_ons, (unsigned long long)c.dma4_reads, (unsigned long long)c.irqs_taken,
-                       c.spu.cd_input_audible() ? "on" : "off", c.spu.cd_vol_l(), c.spu.cd_vol_r(),
-                       !c.music_assist ? "disabled" : c.assist_active ? "ACTIVE (CD mixed in directly)" : "idle", pad_names(cur_pad).c_str());
+                       c.spu.cd_input_audible() ? "on" : "off", c.spu.rvb_vol_l(), c.spu.rvb_vol_r(),
+                       (c.spu.rvb_vol_l() | c.spu.rvb_vol_r()) ? " (music playing)" : " (silent)", pad_names(cur_pad).c_str());
             if (fps < 45.0 && hb_frames > 0) g_log.note("WARNING: running slow (%.1f fps). The game will play too slowly.", fps);
             if (c.vblanks == last_vblanks) g_log.note("WARNING: the game did not advance a single frame in %.0f s", secs);
             last_vblanks = c.vblanks;

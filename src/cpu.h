@@ -124,43 +124,33 @@ public:
         if (icount >= next_vblank) { next_vblank += 677376; uint32_t st = rd(&io[0x70], 4) | 1u; wr(&io[0x70], st, 4); ++vblanks; }  // PAL 50 Hz
     }
     static constexpr size_t kRing = 16384;          // interleaved stereo int16 slots of CD-DA samples awaiting mixing
-    std::vector<int16_t> ring_ = std::vector<int16_t>(kRing, 0); size_t ring_r_ = 0, ring_w_ = 0; uint32_t spu_acc_ = 0;
+    std::vector<int16_t> ring_ = std::vector<int16_t>(kRing, 0), rvb_ring_ = std::vector<int16_t>(kRing, 0), rvb_buf_; size_t ring_r_ = 0, ring_w_ = 0; uint32_t spu_acc_ = 0;
     void spu_cd_tick() {   // one 44.1 kHz tick = 768 CPU cycles
         int16_t s[2] = {0, 0};
         cd.audio_samples(1, s);
         spu.capture_tick(s[0], s[1]);
         if (spu.take_irq()) irq_set(9);
+        { int rl, rr; spu.rvb_out(rl, rr); rvb_ring_[ring_w_] = (int16_t)rl; rvb_ring_[ring_w_ + 1] = (int16_t)rr; }
         ring_[ring_w_] = s[0]; ring_[ring_w_ + 1] = s[1]; ring_w_ = (ring_w_ + 2) % kRing;
         if (ring_w_ == ring_r_) ring_r_ = (ring_r_ + 2) % kRing;   // drop the oldest sample if nobody is mixing
     }
     uint64_t vblanks = 0, irqs_taken = 0, dma4_reads = 0, dma4_writes = 0, dma4_write_words = 0;
-    uint32_t dma4_wr_last_xfer = 0, dma4_wr_last_words = 0, dma4_wr_last_madr = 0; uint64_t dma4_wr_abs_total = 0; uint32_t dma4_wr_pc = 0, dma4_wr_ra = 0; std::vector<uint8_t>* dma4_rd_log = nullptr; std::vector<uint8_t>* dma4_wr_log = nullptr;
+    uint32_t dma4_wr_last_xfer = 0, dma4_wr_last_words = 0, dma4_wr_last_madr = 0; uint64_t dma4_wr_abs_total = 0; uint32_t dma4_wr_pc = 0, dma4_wr_ra = 0; std::vector<uint8_t>* dma4_rd_log = nullptr; std::vector<uint8_t>* dma4_wr_log = nullptr; std::map<uint32_t, uint64_t>* dma4_wr_addr_hist = nullptr;
     uint32_t dma4_last_madr = 0, dma4_last_words = 0, dma4_last_xfer = 0;
     // n stereo frames (interleaved int16) of everything audible: SPU voices + CD audio.
     // Audio output for one video frame. The CD-DA stream, its SPU capture buffers and the SPU IRQ are advanced by
     // the CPU loop (see spu_cd_tick), so they stay correct even if nobody calls this; it only mixes the voices with
     // the CD samples queued by the loop. SPU voice envelopes still advance here, so call it once per video frame.
     void audio_frame(int n, int16_t* out) {
-        cd_buf_.assign((size_t)n * 2, 0);
+        cd_buf_.assign((size_t)n * 2, 0); rvb_buf_.assign((size_t)n * 2, 0);
         for (int i = 0; i < n && ring_r_ != ring_w_; ++i) {
             cd_buf_[2 * i] = ring_[ring_r_]; cd_buf_[2 * i + 1] = ring_[ring_r_ + 1];
+            rvb_buf_[2 * i] = rvb_ring_[ring_r_]; rvb_buf_[2 * i + 1] = rvb_ring_[ring_r_ + 1];
             ring_r_ = (ring_r_ + 2) % kRing;
         }
-        spu.mix(n, out, cd_buf_.data());
+        spu.mix(n, out, cd_buf_.data(), rvb_buf_.data());
         if (spu.take_irq()) irq_set(9);
-        // WORKAROUND ("music assist"): during a level Vib-Ribbon plays the CD with the SPU's CD input switched off
-        // (volume 0), and I have not found how the original delivers the music. So while the CD is playing, un-muted,
-        // and the game is NOT routing it through the SPU, mix the CD audio straight into the output. It plays live
-        // (no delay), so it may be out of step with the ribbon. Switch off with music_assist = false (F9 in the app).
-        assist_active = music_assist && cd.playing && !cd.muted && !spu.cd_input_audible();
-        if (assist_active) {
-            for (int i = 0; i < n * 2; ++i) {
-                int v = out[i] + (cd_buf_[i] * assist_gain_) / 100;
-                out[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
-            }
-        }
     }
-    bool music_assist = true, assist_active = false; int assist_gain_ = 60;   // gain = percent of the CD level
     uint16_t pad1 = 0;   // controller 1, ACTIVE-HIGH (see pad_map.h); set by the frontend
     // Runs until the next vblank has occurred (or max instructions). Returns false if halted.
     bool run_frame(uint64_t max_instr = 2000000) {
@@ -605,7 +595,7 @@ private:
                 for (uint32_t i = 0; i < words; ++i) write(madr + 4 * i, spu.dma_read_word(), 4);
                 if (dma4_rd_log) for (uint32_t i = 0; i < words * 4; ++i) dma4_rd_log->push_back(ram[(madr + i) & 0x1FFFFF]);
             }
-            if (chcr & 1) { ++dma4_writes; dma4_write_words += words; dma4_wr_last_xfer = spu.xfer; dma4_wr_last_words = words; dma4_wr_last_madr = madr; dma4_wr_pc = pc; dma4_wr_ra = r[31]; if (dma4_wr_log) for (uint32_t i = 0; i < words * 4; ++i) dma4_wr_log->push_back(ram[(madr + i) & 0x1FFFFF]); { long s = 0; for (uint32_t i = 0; i < words; ++i) { int16_t a = (int16_t)read(madr + 4 * i, 2), b = (int16_t)read(madr + 4 * i + 2, 2); s += std::abs((int)a) + std::abs((int)b); } dma4_wr_abs_total += (uint64_t)s; }
+            if (chcr & 1) { ++dma4_writes; dma4_write_words += words; dma4_wr_last_xfer = spu.xfer; dma4_wr_last_words = words; dma4_wr_last_madr = madr; dma4_wr_pc = pc; dma4_wr_ra = r[31]; if (dma4_wr_addr_hist) (*dma4_wr_addr_hist)[spu.xfer * 1 + 0] += 1; if (dma4_wr_log) for (uint32_t i = 0; i < words * 4; ++i) dma4_wr_log->push_back(ram[(madr + i) & 0x1FFFFF]); { long s = 0; for (uint32_t i = 0; i < words; ++i) { int16_t a = (int16_t)read(madr + 4 * i, 2), b = (int16_t)read(madr + 4 * i + 2, 2); s += std::abs((int)a) + std::abs((int)b); } dma4_wr_abs_total += (uint64_t)s; }
                             for (uint32_t i = 0; i < words; ++i) spu.dma_write_word(read(madr + 4 * i, 4)); }
             if (spu.take_irq()) irq_set(9);
             break;

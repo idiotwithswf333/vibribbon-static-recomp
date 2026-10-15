@@ -45,3 +45,5 @@ add_executable(howto_e2e tests/howto_e2e.cpp)   # howto_e2e bios.bin game.cue pr
 add_executable(script_run tests/script_run.cpp)   # script_run bios.bin game.cue prefix "w1500 X w400 X p" -- drive menus with a tiny script, screenshots + state
 add_executable(runlog_test tests/runlog_test.cpp)   # unit test for the run log
 add_executable(cdvol_watch tests/cdvol_watch.cpp)   # cdvol_watch bios cue "w1500 X w400 X ..." -- logs SPU CD volume / CD play+mute changes
+add_executable(spu_reverb_test tests/spu_reverb_test.cpp)   # reverb unit as a PCM player (how the game plays its music)
+add_executable(music_timeline tests/music_timeline.cpp)    # music_timeline bios cue [out.wav] -- Bronze level output level over time, with a pause

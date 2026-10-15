@@ -97,23 +97,26 @@ The garbled line art on the first transition is the game's own scribble effect, 
 `script_run bios.bin game.cue out "w1500 X w400 X w1500 X w150 X w300 p"` (wN = wait N frames, X/O/T/Q/U/D/L/R/S =
 6-frame taps through the tap filter, p = screenshot + state line).
 
-## Music in levels (workaround, not a real fix)
+## Music in levels: the SPU reverb unit
 
-Reported: no music during levels. What I found by tracing a Bronze level:
+Vib-Ribbon plays a level's music through the **SPU reverb unit, used as a delayed PCM player**:
 
-- The CD drive plays track 2 correctly (position advances 1.5 sectors/frame, Demute is sent) and the ribbon is built from
-  the CD audio read back through the SPU capture buffers, so the analysis path works.
-- In levels the game keeps the SPU's **CD input off** (volume 0, SPUCNT bit 0 clear). `MAIN_G.EXE` only ever *zeroes* it
-  (one `SpuSetCommonAttr` call with an empty attribute block); the **tutorial** (`MAIN_K.EXE`) does raise it to 0x7FFF.
-  So with correct hardware emulation nothing would reach the speakers, and I did not find how the original delivers the
-  music (the data the game writes back into SPU RAM is all zeros; the only voices are sound effects).
-- **Workaround ("music assist")**: while the CD is playing, un-muted, and the game is *not* routing it through the SPU,
-  the CD audio is mixed straight into the output (60 % level). `Cpu::music_assist`; **F9** toggles it in the app; the run
-  log's heartbeat shows `SPU CD input: on/off` and `music assist: idle / ACTIVE / disabled`. The window title shows
-  `F9 music assist: ON/OFF (playing)` and `F10 tap filter: ON/OFF`, and the log notes when the assist engages.
-  It starts ON; each F9 press flips it, so an even number of presses leaves it as it was.
-- Caveat: the audio is live, not delayed. If the original delays the music relative to the ribbon, the beat may arrive
-  early against the obstacles. Please report how it feels.
+- The game captures the CD audio through the SPU capture buffers (SPU IRQ + DMA channel 4 read-back, see fixes 3-5) and
+  analyses it to build the ribbon. It keeps that audio for **~8 s** (the lookahead), then writes it back, 256 bytes per
+  SPU IRQ, into the **reverb work area at the very top of SPU RAM (0x7FE00-0x7FFFF)** and sets the reverb output volume
+  (vLOUT/vROUT, 0x1F801D84/86) to 0x7FFF. The SPU's CD input stays off the whole time.
+- The reverb volume is the game's **music on/off switch**: it is 0 until the lookahead has filled (~8 s after the level
+  loads, so no music during the intro), and the game zeroes it on pause (START opens "Go on, try again! / Quit").
+  "Go on, try again!" restarts the level and the ~8 s lookahead.
+- `spu.h` now implements the reverb unit (psx-spx "SPU Reverb Formula", 22.05 kHz, linear upsampling) inside the
+  CPU-timed 44.1 kHz tick, so it stays in step with the game's DMA writes into the tiny ring.
+- Verified with `tests/music_timeline.cpp`: the emulator's output correlates with the real CD track 2 audio at **0.99 /
+  0.98** with a constant **8.0 s delay**, starts ~8 s after the level loads and goes silent on pause.
+  `tests/spu_reverb_test.cpp` unit-tests the reverb as a PCM player.
+- Not implemented: reverb *input* from voices (EON) and from the CD, so sound effects keyed with reverb play dry; the
+  hardware's FIR resampling is approximated with linear interpolation.
+- An earlier "music" workaround (mixing the live CD) was removed: it started the music during the intro and kept
+  it playing in the pause menu, which is exactly what the real mechanism does not do.
 
 Diagnostic tool: `tests/cdvol_watch.cpp` logs every change of the SPU CD volume / enable bit and CD play/mute state.
 
@@ -140,5 +143,5 @@ If something gets stuck, send `vibribbon-log.txt` and I can usually tell where.
 - Silver / Gold, High scores, Options.
 - "Play with my own choice of CD": needs a way to swap in a different CD image.
 - The CD-audio sector data path (`ReadS` data) is still never consumed; the game only needs the SPU capture path.
-- Find how the original gets music out in levels (and whether it delays it), then drop the music-assist workaround.
+- Reverb input from voices (EON) so sound effects get their reverb; hardware-accurate reverb resampling.
 - Find why the menu double-steps on 3+ frame presses (the tap filter is a workaround).

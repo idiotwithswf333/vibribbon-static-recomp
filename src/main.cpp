@@ -306,11 +306,9 @@ int main(int argc, char** argv) {
     if (g_bios.empty()) g_bios = find_bios(saved.cue);
     lm.init(saved, !g_bios.empty(), launcher::file_name(g_bios));
     g_log.note("Launcher settings %s: disc=%s, mods=%s, upscale=%dx", have_settings ? "loaded" : "not found (first run)", saved.cue.c_str(), saved.mods.c_str(), lm.s.upscale);
-    auto to_logical = [&](int mx, int my, float& lx, float& ly) {   // window pixels -> launcher canvas coordinates (it is letterboxed)
-        int ww = 1, wh = 1; SDL_GetWindowSize(win, &ww, &wh);
-        float sc = std::min((float)ww / launcher::kW, (float)wh / launcher::kH);
-        lx = (mx - (ww - launcher::kW * sc) * 0.5f) / sc; ly = (my - (wh - launcher::kH * sc) * 0.5f) / sc;
-    };
+    // With SDL_RenderSetLogicalSize active SDL already hands mouse events over in launcher-canvas coordinates; converting them
+    // again was what shifted every click. (Scripted clicks below are pushed through the same SDL conversion.)
+    auto to_logical = [&](int mx, int my, float& lx, float& ly) { lx = (float)mx; ly = (float)my; };
     auto set_mode = [&](Mode m) {
         mode = m;
         SDL_RenderSetLogicalSize(ren, m == Mode::Launcher ? launcher::kW : 640, m == Mode::Launcher ? launcher::kH : 480);
@@ -365,7 +363,7 @@ int main(int argc, char** argv) {
             if (k == "drop") { se.type = SDL_DROPFILE; se.drop.file = SDL_strdup(v.c_str()); }
             else if (k == "key") { se.type = SDL_KEYDOWN; se.key.keysym.sym = v == "right" ? SDLK_RIGHT : v == "left" ? SDLK_LEFT : v == "up" ? SDLK_UP : v == "down" ? SDLK_DOWN : v == "return" ? SDLK_RETURN : v == "escape" ? SDLK_ESCAPE : v == "f1" ? SDLK_F1 : SDLK_UNKNOWN; }
             else if (k == "click") { se.type = SDL_MOUSEBUTTONDOWN; se.button.button = SDL_BUTTON_LEFT; int ww = 1, wh = 1; SDL_GetWindowSize(win, &ww, &wh);   // click=f,<focus id>
-                int f = std::atoi(v.c_str()); auto el = launcher::shape_of(f); float sc = std::min((float)ww / launcher::kW, (float)wh / launcher::kH);
+                int f = std::atoi(v.c_str()); auto el = launcher::shape_of(f, lm.page_mods); float sc = std::min((float)ww / launcher::kW, (float)wh / launcher::kH);
                 se.button.x = (int)(el.cx * sc + (ww - launcher::kW * sc) * 0.5f); se.button.y = (int)(el.cy * sc + (wh - launcher::kH * sc) * 0.5f); }
             else if (k == "wait") { script_wait = std::atoi(v.c_str()); }
             else if (k == "quit") { se.type = SDL_QUIT; }
@@ -402,12 +400,12 @@ int main(int argc, char** argv) {
                     case SDLK_RIGHT: case SDLK_d: lm.nav(1, 0); break;
                     case SDLK_UP: case SDLK_w: lm.nav(0, -1); break;
                     case SDLK_DOWN: case SDLK_s: lm.nav(0, 1); break;
-                    case SDLK_TAB: lm.focus = (lm.focus + 1) % launcher::F_COUNT; break;
+                    case SDLK_TAB: lm.tab(); break;
                     case SDLK_RETURN: case SDLK_KP_ENTER: case SDLK_SPACE: {
                         const int f = lm.focus; lm.activate(f);
                         if (f >= launcher::F_UP1 && f <= launcher::F_UP4) lm.focus = launcher::F_START;   // size picked: on to START
                         break; }
-                    case SDLK_DELETE: case SDLK_BACKSPACE: if (lm.focus == launcher::F_MODS) lm.clear_mods(); break;
+                    case SDLK_DELETE: case SDLK_BACKSPACE: if (lm.page_mods && lm.focus == launcher::F_MODS) lm.clear_mods(); break;
                     default: break;
                     }
                     ldirty = true;
@@ -427,7 +425,7 @@ int main(int argc, char** argv) {
             }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F1 && mode == Mode::Game) go_launcher("");
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) {   // Esc: game -> launcher, launcher -> quit
-                if (mode == Mode::Game) go_launcher(""); else { running = false; g_log.note("Esc pressed: closing"); }
+                if (mode == Mode::Game) go_launcher(""); else if (lm.page_mods) { lm.close_mods(); ldirty = true; } else { running = false; g_log.note("Esc pressed: closing"); }
             }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F9) {   // neon glow on/off
                 neon = !neon;

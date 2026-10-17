@@ -388,7 +388,7 @@ private:
     void line_seg(int x0, int y0, uint32_t c0, int x1, int y1, uint32_t c1, bool gour, bool semi) {
         x0 += off_x_; y0 += off_y_; x1 += off_x_; y1 += off_y_;
         int dx = x1 - x0, dy = y1 - y0, n = std::max(std::abs(dx), std::abs(dy));
-        if (std::abs(dx) > 1023 || std::abs(dy) > 511) return;
+        if (std::abs(dx) > 4096 || std::abs(dy) > 4096) return;   // real hardware drops lines over 1023 x 511; we draw them clipped instead (guess for the missing flat ribbon)
         if (scale_ > 1) hi_line(x0, y0, c0, x1, y1, c1, gour, semi);   // smooth version for the upscaled picture
         for (int i = 0; i <= n; ++i) {
             int x = n ? x0 + dx * i / n : x0, y = n ? y0 + dy * i / n : y0;

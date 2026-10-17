@@ -101,7 +101,7 @@ inline ZipCheck check_zip(const std::string& path) {
 }
 
 // ---- the model ----------------------------------------------------------------------------------------------------
-enum Focus { F_DISC = 0, F_MODS, F_UP1, F_UP2, F_UP3, F_UP4, F_OPT_GLOW, F_OPT_FF, F_OPT_SHOT, F_START, F_COUNT, F_CLEAR = 100, F_NONE = -1 };
+enum Focus { F_DISC = 0, F_MODS, F_UP1, F_UP2, F_UP3, F_UP4, F_OPT_GLOW, F_OPT_FF, F_OPT_SHOT, F_START, F_BACK, F_COUNT, F_CLEAR = 100, F_NONE = -1 };
 
 struct Model {
     Settings s;
@@ -110,6 +110,7 @@ struct Model {
     bool bios_ok = false; std::string bios_name;
     int focus = F_START, hover = F_NONE;
     bool start_requested = false;
+    bool page_mods = false;   // the "LIST MODS" sub-page (mods zip + neon glow) is open
     std::string toast; int toast_ttl = 0;   // short message, ttl counts frames
 
     void init(const Settings& saved, bool bios_found, const std::string& bios) {
@@ -140,7 +141,16 @@ struct Model {
     }
     void clear_mods() { s.mods.clear(); zip = ZipCheck(); say("MODS CLEARED"); }
     void set_upscale(int n) { s.upscale = std::clamp(n, 1, 4); }
-    static bool is_opt(int f) { return f >= F_OPT_GLOW && f <= F_OPT_SHOT; }
+    static bool is_opt(int f) { return f == F_OPT_FF || f == F_OPT_SHOT; }   // main-page check boxes (glow lives on the mods page)
+    void open_mods() { page_mods = true; focus = F_OPT_GLOW; hover = F_NONE; }
+    void close_mods() { page_mods = false; focus = F_MODS; hover = F_NONE; }
+    void tab() {   // Tab: next thing on the current page
+        static const int main_order[] = {F_DISC, F_MODS, F_UP1, F_UP2, F_UP3, F_UP4, F_OPT_FF, F_OPT_SHOT, F_START};
+        static const int mods_order[] = {F_MODS, F_OPT_GLOW, F_BACK};
+        const int* o = page_mods ? mods_order : main_order; const int n = page_mods ? 3 : 9;
+        int i = 0; for (; i < n; ++i) if (o[i] == focus) break;
+        focus = o[(i + 1) % n];
+    }
     bool& opt_ref(int f) { return f == F_OPT_GLOW ? s.glow : (f == F_OPT_FF ? s.ffwd : s.shot); }
     void toggle_opt(int f) {
         bool& b = opt_ref(f); b = !b;
@@ -150,16 +160,23 @@ struct Model {
 
     // Keyboard / controller navigation: dx, dy in {-1,0,1}. Left/right over the upscale chips also picks that size.
     void nav(int dx, int dy) {
+        if (page_mods) {
+            static const int order[] = {F_MODS, F_OPT_GLOW, F_BACK};
+            int i = 0; for (; i < 3; ++i) if (order[i] == focus) break;
+            if (i == 3) { focus = F_OPT_GLOW; return; }
+            focus = order[std::clamp(i + dy, 0, 2)];
+            return;
+        }
         if (focus >= F_UP1 && focus <= F_UP4 && dx) { focus = std::clamp(focus + dx, (int)F_UP1, (int)F_UP4); set_upscale(focus - F_UP1 + 1); return; }
-        if (is_opt(focus) && dx) { focus = std::clamp(focus + dx, (int)F_OPT_GLOW, (int)F_OPT_SHOT); return; }
+        if (is_opt(focus) && dx) { focus = dx < 0 ? (int)F_OPT_FF : (int)F_OPT_SHOT; return; }
         if (focus == F_DISC && dx > 0) { focus = F_MODS; return; }
         if (focus == F_MODS && dx < 0) { focus = F_DISC; return; }
         if (dy > 0) {
             if (focus == F_DISC || focus == F_MODS) focus = F_UP1 + s.upscale - 1;
-            else if (focus >= F_UP1 && focus <= F_UP4) focus = F_OPT_GLOW;
+            else if (focus >= F_UP1 && focus <= F_UP4) focus = F_OPT_FF;
             else if (is_opt(focus)) focus = F_START;
         } else if (dy < 0) {
-            if (focus == F_START) focus = F_OPT_GLOW;
+            if (focus == F_START) focus = F_OPT_FF;
             else if (is_opt(focus)) focus = F_UP1 + s.upscale - 1;
             else if (focus >= F_UP1 && focus <= F_UP4) focus = (focus <= F_UP2) ? F_DISC : F_MODS;
         }
@@ -167,9 +184,11 @@ struct Model {
     // Enter / controller CROSS / mouse click on `f`.
     void activate(int f) {
         focus = f == F_CLEAR ? (int)F_MODS : f;
+        if (f == F_BACK) { close_mods(); return; }
+        if (f == F_MODS && !page_mods) { open_mods(); return; }
         if (f == F_START) { if (can_start()) start_requested = true; else say("DROP YOUR VIB-RIBBON .CUE FILE FIRST"); }
         else if (f >= F_UP1 && f <= F_UP4) set_upscale(f - F_UP1 + 1);
-        else if (is_opt(f)) toggle_opt(f);
+        else if (is_opt(f) || f == F_OPT_GLOW) toggle_opt(f);
         else if (f == F_CLEAR) clear_mods();
         else if (f == F_DISC) say("DRAG YOUR .CUE FILE ONTO THIS WINDOW");
         else if (f == F_MODS) say("DRAG A MODS .ZIP ONTO THIS WINDOW (OPTIONAL)");
@@ -178,7 +197,16 @@ struct Model {
 
 // ---- layout ------------------------------------------------------------------------------------------------------
 struct Ellipse { float cx, cy, rx, ry; };
-inline Ellipse shape_of(int f) {
+inline Ellipse shape_of(int f, bool mods_page = false) {
+    if (mods_page) {
+        switch (f) {
+        case F_MODS: return {820, 400, 560, 102};
+        case F_CLEAR: return {1330, 400, 40, 30};
+        case F_OPT_GLOW: return {960, 640, 330, 52};
+        case F_BACK: return {960, 942, 330, 58};
+        default: return {0, 0, 1, 1};
+        }
+    }
     switch (f) {
     case F_DISC: return {520, 385, 400, 102};
     case F_MODS: return {1400, 385, 400, 102};
@@ -186,18 +214,22 @@ inline Ellipse shape_of(int f) {
     case F_UP2: return {835, 600, 105, 44};
     case F_UP3: return {1085, 600, 105, 44};
     case F_UP4: return {1335, 600, 105, 44};
-    case F_OPT_GLOW: return {420, 825, 260, 44};
-    case F_OPT_FF: return {960, 825, 260, 44};
-    case F_OPT_SHOT: return {1500, 825, 260, 44};
+    case F_OPT_GLOW: return {0, 0, 1, 1};   // lives on the mods page
+    case F_OPT_FF: return {620, 825, 300, 44};
+    case F_OPT_SHOT: return {1300, 825, 300, 44};
     case F_START: return {960, 942, 330, 58};
-    case F_CLEAR: return {1862, 385, 40, 30};
+    case F_CLEAR: return {0, 0, 1, 1};
     default: return {0, 0, 1, 1};
     }
 }
 inline int hit_test(const Model& m, float x, float y) {
-    for (int f : {(int)F_CLEAR, (int)F_START, (int)F_OPT_GLOW, (int)F_OPT_FF, (int)F_OPT_SHOT, (int)F_UP1, (int)F_UP2, (int)F_UP3, (int)F_UP4, (int)F_DISC, (int)F_MODS}) {
+    static const int main_ids[] = {F_START, F_OPT_FF, F_OPT_SHOT, F_UP1, F_UP2, F_UP3, F_UP4, F_DISC, F_MODS};
+    static const int mods_ids[] = {F_CLEAR, F_BACK, F_OPT_GLOW, F_MODS};
+    const int* ids = m.page_mods ? mods_ids : main_ids; const int n = m.page_mods ? 4 : 9;
+    for (int k = 0; k < n; ++k) {
+        const int f = ids[k];
         if (f == F_CLEAR && m.s.mods.empty()) continue;
-        Ellipse e = shape_of(f);
+        Ellipse e = shape_of(f, m.page_mods);
         float a = (x - e.cx) / e.rx, b = (y - e.cy) / e.ry;
         if (a * a + b * b <= 1.0f) return f;
     }
@@ -238,9 +270,43 @@ inline void draw(vec::Canvas& cv, const Model& m, int frame = 0) {
         cv.polyline(r, WHITE, 3.5f);
     }
 
+    vec::text(cv, 1860, 100, 3.2f, "V0.13.0", DIM, 2.2f, 2);
+    if (m.page_mods) {   // ---- the LIST MODS page: mods zip + neon glow ----
+        auto bub = [&](int f, uint32_t col, float width) {
+            Ellipse e = shape_of(f, true); const bool hv = m.hover == f, fo = m.focus == f;
+            cv.bubble(e.cx, e.cy, e.rx, e.ry, hv ? WHITE : col, hv ? width + 1.5f : width);
+            if (fo) cv.bubble(e.cx, e.cy, e.rx + 16, e.ry + 12, VIOLET, 3.0f, 0.9f);
+        };
+        vec::text(cv, 960, 300, 5, "MODS", DIM, 3.0f, 1);
+        { Ellipse e = shape_of(F_MODS, true); const bool have = !m.s.mods.empty();
+          bub(F_MODS, have ? (m.zip.ok ? VIOLET : RED) : WHITE, 3.5f);
+          if (!have) { vec::text(cv, e.cx, e.cy - 30, 6, "DROP A MODS .ZIP", WHITE, 3.5f, 1); vec::text(cv, e.cx, e.cy + 36, 4, "OPTIONAL - NO MODS YET", DIM, 2.5f, 1); }
+          else {
+              std::string n = upper(file_name(m.s.mods)); vec::text(cv, e.cx, e.cy - 30, fit(n, 6, 900), n, WHITE, 3.5f, 1);
+              vec::text(cv, e.cx, e.cy + 28, fit(m.zip.msg, 4, 900), m.zip.msg, m.zip.ok ? VIOLET : RED, 2.5f, 1);
+              if (m.zip.ok) vec::text(cv, e.cx, e.cy + 66, 3.4f, "NOT SUPPORTED YET", DIM, 2.2f, 1);
+              Ellipse c = shape_of(F_CLEAR, true);
+              cv.bubble(c.cx, c.cy, c.rx, c.ry, m.hover == F_CLEAR ? WHITE : DIM, 3.0f);
+              vec::text(cv, c.cx, c.cy - 13, 4.4f, "X", m.hover == F_CLEAR ? WHITE : DIM, 3.0f, 1);
+          } }
+        { Ellipse e = shape_of(F_OPT_GLOW, true); const bool on = m.s.glow;
+          bub(F_OPT_GLOW, on ? GREEN : DIM, on ? 4.0f : 3.0f);
+          const float bx = e.cx - e.rx + 70, by = e.cy, hs = 22;
+          cv.polyline({{bx - hs, by - hs}, {bx + hs, by - hs}, {bx + hs, by + hs}, {bx - hs, by + hs}}, on ? GREEN : (m.hover == F_OPT_GLOW ? WHITE : DIM), 3.5f, true);
+          if (on) cv.polyline({{bx - 12, by + 1}, {bx - 3, by + 12}, {bx + 14, by - 13}}, GREEN, 5.5f);
+          const float tx = e.cx + 42;
+          vec::text(cv, tx, e.cy - 28, 4.6f, "NEON GLOW", on ? GREEN : (m.hover == F_OPT_GLOW ? WHITE : DIM), 3.0f, 1);
+          vec::text(cv, tx, e.cy + 8, fit("SOFT GLOW AROUND THE LINES (F9)", 2.8f, 440), "SOFT GLOW AROUND THE LINES (F9)", DIM, 2.0f, 1); }
+        { Ellipse e = shape_of(F_BACK, true); bub(F_BACK, GREEN, 4.5f); vec::text(cv, e.cx, e.cy - 28, 7, "BACK", GREEN, 4.5f, 1); }
+        if (!m.toast.empty()) vec::text(cv, 960, 1008, fit(m.toast, 4.0f, 1500), m.toast, VIOLET, 2.6f, 1);
+        vec::text(cv, 60, 1048, 3.2f, m.bios_ok ? "BIOS: " + upper(m.bios_name) : "BIOS MISSING - DROP BIOS.BIN HERE", m.bios_ok ? GREEN : RED, 2.2f, 0);
+        vec::text(cv, 1860, 1048, 3.2f, "ARROWS + ENTER   ESC BACK", DIM, 2.2f, 2);
+        return;
+    }
+
     // ---- the focus / hover / selected look for one bubble ----
     auto bubble = [&](int f, uint32_t col, float width) {
-        Ellipse e = shape_of(f);
+        Ellipse e = shape_of(f, m.page_mods);
         const bool hv = m.hover == f, fo = m.focus == f;
         cv.bubble(e.cx, e.cy, e.rx, e.ry, hv ? WHITE : col, hv ? width + 1.5f : width);
         if (fo) cv.bubble(e.cx, e.cy, e.rx + 16, e.ry + 12, VIOLET, 3.0f, 0.9f);
@@ -260,24 +326,14 @@ inline void draw(vec::Canvas& cv, const Model& m, int frame = 0) {
             vec::text(cv, e.cx, e.cy + 36, fit(m.disc.msg, 4, 640), m.disc.msg, m.disc.ok ? GREEN : RED, 2.5f, 1);
         }
     }
-    // ---- 2: mods ----
+    // ---- 2: list mods (opens the mods page) ----
     {
         Ellipse e = shape_of(F_MODS);
         const bool have = !m.s.mods.empty();
         bubble(F_MODS, have ? (m.zip.ok ? VIOLET : RED) : WHITE, 3.5f);
-        vec::text(cv, e.cx, e.cy - 64, 3.6f, "2  MODS (OPTIONAL)", DIM, 2.3f, 1);
-        if (!have) {
-            vec::text(cv, e.cx, e.cy - 30, 6, "DROP A MODS .ZIP", WHITE, 3.5f, 1);
-            vec::text(cv, e.cx, e.cy + 36, 4, "OPTIONAL - NO MODS YET", DIM, 2.5f, 1);
-        } else {
-            { std::string n = upper(file_name(m.s.mods)); vec::text(cv, e.cx, e.cy - 30, fit(n, 6, 560), n, WHITE, 3.5f, 1); }
-            vec::text(cv, e.cx, e.cy + 28, fit(m.zip.msg, 4, 560), m.zip.msg, m.zip.ok ? VIOLET : RED, 2.5f, 1);
-            if (m.zip.ok) vec::text(cv, e.cx, e.cy + 66, 3.4f, "NOT SUPPORTED YET", DIM, 2.2f, 1);
-            // small clear button
-            Ellipse c = shape_of(F_CLEAR);
-            cv.bubble(c.cx, c.cy, c.rx, c.ry, m.hover == F_CLEAR ? WHITE : DIM, 3.0f);
-            vec::text(cv, c.cx, c.cy - 13, 4.4f, "X", m.hover == F_CLEAR ? WHITE : DIM, 3.0f, 1);
-        }
+        vec::text(cv, e.cx, e.cy - 64, 3.6f, "2  MODS + GLOW", DIM, 2.3f, 1);
+        vec::text(cv, e.cx, e.cy - 30, 6, "LIST MODS", WHITE, 3.5f, 1);
+        vec::text(cv, e.cx, e.cy + 36, 4, have ? "MODS ZIP ADDED" : "NEON GLOW AND MODS ZIP", have ? VIOLET : DIM, 2.5f, 1);
     }
     // ---- 3: upscale ----
     {
@@ -300,8 +356,7 @@ inline void draw(vec::Canvas& cv, const Model& m, int frame = 0) {
     {
         vec::text(cv, 960, 718, 5, "4  OPTIONS", DIM, 3.0f, 1);
         struct Opt { int f; const char* name; const char* hint; bool on; };
-        const Opt opts[3] = {{F_OPT_GLOW, "NEON GLOW", "SOFT GLOW AROUND THE LINES (F9)", m.s.glow},
-                             {F_OPT_FF, "FAST-FORWARD", "HOLD TAB OR PRESS R-STICK", m.s.ffwd},
+        const Opt opts[2] = {{F_OPT_FF, "FAST-FORWARD", "HOLD TAB OR PRESS R-STICK", m.s.ffwd},
                              {F_OPT_SHOT, "SCREENSHOTS", "F12 SAVES A .BMP PICTURE", m.s.shot}};
         for (const Opt& o : opts) {
             Ellipse e = shape_of(o.f);

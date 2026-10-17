@@ -53,6 +53,13 @@ Keyboard: arrows or WASD = D-pad, Z/Space = Cross, X = Circle, C = Square, V = T
 | Windows build (`src/main.cpp`, CMake, CI) | Written and type-checked, **never compiled with real SDL** -- first CI run may need a small fix |
 | Gouraud/dither/exact fill rules, semi-transparency edge cases | Approximate |
 
+## 0.13.0
+
+- Launcher: the mods box is now **LIST MODS**, which opens a sub-page with the mods .zip drop area, the **Neon glow** check box and BACK (Esc also goes back). Fast-forward and Screenshots stay on the main page.
+- Fixed launcher clicks landing in the wrong place (mouse coordinates were being converted twice).
+- GPU: lines longer than the PS1 limit are now drawn clipped instead of dropped (attempt at the missing flat ribbon; unverified).
+- CI: working `build.yml` replaced.
+
 ## In-game extras (new in wip10/wip11)
 
 - **Screenshots (F12)**: saves the current game picture as a `.bmp` in a `screenshots` folder next to the exe

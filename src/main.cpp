@@ -19,6 +19,7 @@
 #include "disc.h"
 #include <initializer_list>
 #include "pad_map.h"
+#include "launcher.h"
 #include "runlog.h"
 
 namespace {
@@ -202,7 +203,7 @@ int main(int argc, char** argv) {
         g_log.note("Log file: %s", g_log.path().c_str());
         for (int i = 1; i < argc; ++i) g_log.note("Command line argument %d: %s", i, argv[i]);
     }
-    SDL_Window* win = SDL_CreateWindow("Vib-Ribbon - drop vibribbon.cue here", SDL_WINDOWPOS_CENTERED,
+    SDL_Window* win = SDL_CreateWindow("Vib-Ribbon launcher", SDL_WINDOWPOS_CENTERED,
                                        SDL_WINDOWPOS_CENTERED, 960, 720, SDL_WINDOW_RESIZABLE);
     SDL_Renderer* ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED) : nullptr;
     if (!win || !ren) {
@@ -253,12 +254,48 @@ int main(int argc, char** argv) {
         g_log.set_summary(b);
     };
 
+    // ---- launcher ----
+    enum class Mode { Launcher, Game };
+    Mode mode = Mode::Launcher;
+    std::string exe_dir = ".";
+    if (char* base = SDL_GetBasePath()) { exe_dir = base; SDL_free(base); }
+    const std::string settings_path = (std::filesystem::path(exe_dir) / "vibribbon-settings.ini").string();
+    launcher::Settings saved;
+    const bool have_settings = launcher::load_settings(settings_path, saved);
+    launcher::Model lm;
+    vec::Canvas lcv;
+    SDL_Texture* ltex = nullptr;
+    bool ldirty = true;
+    if (argc > 1) saved.cue = argv[1];   // a disc given on the command line starts straight away
+    if (g_bios.empty()) g_bios = find_bios(saved.cue);
+    lm.init(saved, !g_bios.empty(), launcher::file_name(g_bios));
+    g_log.note("Launcher settings %s: disc=%s, mods=%s, upscale=%dx", have_settings ? "loaded" : "not found (first run)", saved.cue.c_str(), saved.mods.c_str(), lm.s.upscale);
+    auto to_logical = [&](int mx, int my, float& lx, float& ly) {   // window pixels -> launcher canvas coordinates (it is letterboxed)
+        int ww = 1, wh = 1; SDL_GetWindowSize(win, &ww, &wh);
+        float sc = std::min((float)ww / launcher::kW, (float)wh / launcher::kH);
+        lx = (mx - (ww - launcher::kW * sc) * 0.5f) / sc; ly = (my - (wh - launcher::kH * sc) * 0.5f) / sc;
+    };
+    auto set_mode = [&](Mode m) {
+        mode = m;
+        SDL_RenderSetLogicalSize(ren, m == Mode::Launcher ? launcher::kW : 640, m == Mode::Launcher ? launcher::kH : 480);
+        if (!fullscreen) SDL_SetWindowSize(win, m == Mode::Launcher ? 1280 : 960, 720);
+        if (m == Mode::Launcher) { ldirty = true; SDL_SetWindowTitle(win, "Vib-Ribbon launcher"); }
+    };
+    auto go_launcher = [&](const std::string& toast) {
+        emu.cpu.reset(); emu.img.reset();
+        if (audio) SDL_ClearQueuedAudio(audio);
+        set_mode(Mode::Launcher);
+        if (!toast.empty()) lm.say(toast, 400);
+        g_log.note("Back at the launcher%s%s", toast.empty() ? "" : ": ", toast.c_str());
+    };
+
     std::string last_cue;
     uint32_t warn_until = 0;
     auto start = [&](const std::string& cue) {
         last_cue = cue; last_disc = cue;
-        g_log.note("Loading disc: %s", cue.c_str());
+        g_log.note("Loading disc: %s (upscale %dx)", cue.c_str(), lm.s.upscale);
         std::string msg = boot_disc(cue, emu);
+        if (emu.cpu) emu.cpu->gpu.set_scale(lm.s.upscale);
         g_log.note("BIOS in use: %s", g_bios.empty() ? "none found" : g_bios.c_str());
         g_log.note("Boot result: %s", msg.empty() ? "started OK" : msg.c_str());
         last_halt = "no"; hb_last = SDL_GetTicks(); hb_frames = 0; same_hash = 0; last_hash = 0; last_vblanks = 0;
@@ -268,30 +305,91 @@ int main(int argc, char** argv) {
             if (warn) msg = msg.substr(1);
             SDL_SetWindowTitle(win, msg.c_str());
             std::printf("%s\n", msg.c_str());
-            if (warn) warn_until = SDL_GetTicks() + 15000; else emu.cpu.reset();
+            if (warn) warn_until = SDL_GetTicks() + 15000;
+            else { go_launcher(msg); return; }
         }
+        set_mode(Mode::Game);
     };
-    if (argc > 1) start(argv[1]);
+    set_mode(Mode::Launcher);
+    if (argc > 1) start(saved.cue);
+
+    // Developer hook: VIBRIBBON_EVENTS="drop=PATH;key=right;key=return;wait=300;quit" injects events (one per 10 frames).
+    std::vector<std::string> scripted;
+    if (const char* ev = std::getenv("VIBRIBBON_EVENTS")) { std::stringstream ss(ev); for (std::string t; std::getline(ss, t, ';');) scripted.push_back(t); }
+    size_t script_i = 0; int script_wait = 30;
 
     for (bool running = true; running;) {
         uint32_t frame_start = SDL_GetTicks();
+        if (script_i < scripted.size() && script_wait-- <= 0) {   // scripted (developer) events
+            script_wait = 10; std::string t = scripted[script_i++]; SDL_Event se{}; se.type = 0;
+            size_t eq = t.find('='); std::string k = t.substr(0, eq), v = eq == std::string::npos ? "" : t.substr(eq + 1);
+            if (k == "drop") { se.type = SDL_DROPFILE; se.drop.file = SDL_strdup(v.c_str()); }
+            else if (k == "key") { se.type = SDL_KEYDOWN; se.key.keysym.sym = v == "right" ? SDLK_RIGHT : v == "left" ? SDLK_LEFT : v == "up" ? SDLK_UP : v == "down" ? SDLK_DOWN : v == "return" ? SDLK_RETURN : v == "escape" ? SDLK_ESCAPE : v == "f1" ? SDLK_F1 : SDLK_UNKNOWN; }
+            else if (k == "click") { se.type = SDL_MOUSEBUTTONDOWN; se.button.button = SDL_BUTTON_LEFT; int ww = 1, wh = 1; SDL_GetWindowSize(win, &ww, &wh);   // click=f,<focus id>
+                int f = std::atoi(v.c_str()); auto el = launcher::shape_of(f); float sc = std::min((float)ww / launcher::kW, (float)wh / launcher::kH);
+                se.button.x = (int)(el.cx * sc + (ww - launcher::kW * sc) * 0.5f); se.button.y = (int)(el.cy * sc + (wh - launcher::kH * sc) * 0.5f); }
+            else if (k == "wait") { script_wait = std::atoi(v.c_str()); }
+            else if (k == "quit") { se.type = SDL_QUIT; }
+            if (se.type) SDL_PushEvent(&se);
+        }
         for (SDL_Event e; SDL_PollEvent(&e);) {
             if (e.type == SDL_QUIT) { running = false; g_log.note("Window closed by the user"); }
             if (e.type == SDL_DROPFILE) {
                 std::filesystem::path dropped = e.drop.file;
                 g_log.note("File dropped on the window: %s", e.drop.file);
-                if (looks_like_bios(dropped)) {   // a BIOS dropped on the window: remember it next to the exe and restart
+                const bool is_bios = looks_like_bios(dropped);
+                if (is_bios) {   // a BIOS dropped on the window: remember it next to the exe
                     g_bios = dropped.string();
-                    if (char* base = SDL_GetBasePath()) {
-                        std::error_code ec; std::filesystem::copy_file(dropped, std::filesystem::path(base) / "bios.bin",
-                                                                       std::filesystem::copy_options::overwrite_existing, ec);
-                        SDL_free(base);
-                    }
-                    if (!last_cue.empty()) start(last_cue); else SDL_SetWindowTitle(win, "BIOS loaded - now drop vibribbon.cue");
-                } else start(e.drop.file);
+                    std::error_code ec; std::filesystem::copy_file(dropped, std::filesystem::path(exe_dir) / "bios.bin", std::filesystem::copy_options::overwrite_existing, ec);
+                }
+                const std::string what = lm.drop(dropped.string(), is_bios);
+                g_log.note("Dropped file treated as: %s (disc check: %s)", what.c_str(), lm.disc.msg.c_str());
+                ldirty = true;
+                if (mode == Mode::Game) {   // dropping while playing restarts with the new disc/BIOS right away
+                    if (what == "cue" && lm.disc.ok) start(lm.s.cue);
+                    else if (what == "bios" && !last_cue.empty()) start(last_cue);
+                }
                 SDL_free(e.drop.file);
             }
-            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) { running = false; g_log.note("Esc pressed: closing"); }
+            if (mode == Mode::Launcher) {   // ---- launcher input: mouse, keyboard, controller ----
+                if (e.type == SDL_MOUSEMOTION) { float lx, ly; to_logical(e.motion.x, e.motion.y, lx, ly); int h = launcher::hit_test(lm, lx, ly); if (h != lm.hover) { lm.hover = h; ldirty = true; } }
+                if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+                    float lx, ly; to_logical(e.button.x, e.button.y, lx, ly); int f = launcher::hit_test(lm, lx, ly);
+                    if (f != launcher::F_NONE) { lm.activate(f); ldirty = true; }
+                }
+                if (e.type == SDL_KEYDOWN) {
+                    switch (e.key.keysym.sym) {
+                    case SDLK_LEFT: case SDLK_a: lm.nav(-1, 0); break;
+                    case SDLK_RIGHT: case SDLK_d: lm.nav(1, 0); break;
+                    case SDLK_UP: case SDLK_w: lm.nav(0, -1); break;
+                    case SDLK_DOWN: case SDLK_s: lm.nav(0, 1); break;
+                    case SDLK_TAB: lm.focus = (lm.focus + 1) % launcher::F_COUNT; break;
+                    case SDLK_RETURN: case SDLK_KP_ENTER: case SDLK_SPACE: {
+                        const int f = lm.focus; lm.activate(f);
+                        if (f >= launcher::F_UP1 && f <= launcher::F_UP4) lm.focus = launcher::F_START;   // size picked: on to START
+                        break; }
+                    case SDLK_DELETE: case SDLK_BACKSPACE: if (lm.focus == launcher::F_MODS) lm.clear_mods(); break;
+                    default: break;
+                    }
+                    ldirty = true;
+                }
+                if (e.type == SDL_CONTROLLERBUTTONDOWN) {
+                    switch (e.cbutton.button) {
+                    case SDL_CONTROLLER_BUTTON_DPAD_LEFT: lm.nav(-1, 0); break;
+                    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: lm.nav(1, 0); break;
+                    case SDL_CONTROLLER_BUTTON_DPAD_UP: lm.nav(0, -1); break;
+                    case SDL_CONTROLLER_BUTTON_DPAD_DOWN: lm.nav(0, 1); break;
+                    case SDL_CONTROLLER_BUTTON_A: { const int f = lm.focus; lm.activate(f); if (f >= launcher::F_UP1 && f <= launcher::F_UP4) lm.focus = launcher::F_START; break; }
+                    case SDL_CONTROLLER_BUTTON_START: lm.activate(launcher::F_START); break;
+                    default: break;
+                    }
+                    ldirty = true;
+                }
+            }
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F1 && mode == Mode::Game) go_launcher("");
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) {   // Esc: game -> launcher, launcher -> quit
+                if (mode == Mode::Game) go_launcher(""); else { running = false; g_log.note("Esc pressed: closing"); }
+            }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F10) {
                 g_tap.enabled = !g_tap.enabled;
                 std::fprintf(stderr, "D-pad tap filter %s\n", g_tap.enabled ? "ON" : "OFF");
@@ -314,7 +412,27 @@ int main(int argc, char** argv) {
 
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
         SDL_RenderClear(ren);
-        if (emu.cpu) {
+        if (mode == Mode::Launcher) {
+            if (lm.start_requested) {
+                lm.start_requested = false;
+                launcher::save_settings(settings_path, lm.s);
+                g_log.note("START pressed: disc=%s mods=%s upscale=%dx", lm.s.cue.c_str(), lm.s.mods.empty() ? "(none)" : lm.s.mods.c_str(), lm.s.upscale);
+                if (!lm.s.mods.empty()) g_log.note("Mods zip selected (%s, %d files) - mods are not supported yet, so it is ignored", lm.zip.ok ? "valid" : "invalid", lm.zip.files);
+                start(lm.s.cue);
+            }
+            const bool had_toast = !lm.toast.empty(); lm.tick();
+            if (had_toast && lm.toast.empty()) ldirty = true;
+            if (mode == Mode::Launcher) {   // (start() may have switched to the game)
+                if (ldirty) {
+                    launcher::draw(lcv, lm);
+                    if (!ltex) { SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear"); ltex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, launcher::kW, launcher::kH); }
+                    SDL_UpdateTexture(ltex, nullptr, lcv.px.data(), launcher::kW * 4);
+                    ldirty = false;
+                }
+                if (ltex) SDL_RenderCopy(ren, ltex, nullptr, nullptr);
+            }
+        }
+        if (mode == Mode::Game && emu.cpu) {
             emu.cpu->pad1 = g_tap.apply(pad::to_ps1(read_controller()) | read_keyboard());
             static uint16_t last_pad = 0;   // log pad changes so you can see the keyboard is being read
             if (emu.cpu->pad1 != last_pad) {
@@ -329,8 +447,7 @@ int main(int argc, char** argv) {
                 g_log.note("ERROR: %s (CPU position %08X)", m.c_str(), emu.cpu->pc);
                 last_halt = emu.cpu->halt_reason + " (at " + [&] { char t[16]; std::snprintf(t, sizeof t, "%08X", emu.cpu->pc); return std::string(t); }() + ")";
                 update_summary("CPU stopped"); g_log.save();
-                emu.cpu.reset();   // back to waiting for a disc
-                if (audio) SDL_ClearQueuedAudio(audio);
+                go_launcher(m);   // back to the launcher, with the reason shown
             } else {
                 // The SPU voice envelopes and the CD-audio read position only advance inside audio_frame(), and
                 // the game WAITS on both (e.g. "has the sound effect finished?", "has the CD reached the track?").
@@ -343,6 +460,7 @@ int main(int argc, char** argv) {
                 emu.cpu->gpu.display(pixels, w, h);
                 if (!tex || w != tex_w || h != tex_h) {
                     if (tex) SDL_DestroyTexture(tex);
+                    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, emu.cpu->gpu.scale() > 1 ? "linear" : "nearest");   // 1x stays crisp pixels
                     tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, w, h);
                     tex_w = w; tex_h = h;
                 }
@@ -356,7 +474,7 @@ int main(int argc, char** argv) {
         uint32_t now = SDL_GetTicks();
         if (emu.cpu && now - last_title >= 1000 && now > warn_until) {   // FPS in the title bar
             char t[160];
-            std::snprintf(t, sizeof t, "Vib-Ribbon - %u fps (target 50) | F10 tap filter: %s", frames, g_tap.enabled ? "ON" : "OFF");
+            std::snprintf(t, sizeof t, "Vib-Ribbon - %u fps (target 50) | %ux | Esc launcher | F10 tap filter: %s", frames, emu.cpu->gpu.scale(), g_tap.enabled ? "ON" : "OFF");
             SDL_SetWindowTitle(win, t);
             frames = 0; last_title = now;
         }
@@ -393,6 +511,8 @@ int main(int argc, char** argv) {
         if (emu.cpu && spent < 20) SDL_Delay(20 - spent);
         else if (!emu.cpu) SDL_Delay(16);
     }
+    launcher::save_settings(settings_path, lm.s);
+    if (ltex) SDL_DestroyTexture(ltex);
     g_log.note("Shutting down after %u frames", total_frames);
     update_summary("closed normally");
     g_log.save();

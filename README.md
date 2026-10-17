@@ -120,6 +120,55 @@ Vib-Ribbon plays a level's music through the **SPU reverb unit, used as a delaye
 
 Diagnostic tool: `tests/cdvol_watch.cpp` logs every change of the SPU CD volume / enable bit and CD play/mute state.
 
+## Launcher and upscaling
+
+Starting the app (without a disc on the command line) opens the **launcher**, drawn with the same smooth vector lines:
+
+1. **Disc**: drop `vibribbon.cue` on the window (checked on the spot: it must be the Vib-Ribbon EU disc).
+2. **Mods** (optional): drop a `.zip`. It is checked and remembered, but mods are **not supported yet**; this is the placeholder.
+3. **Upscale**: 1x = the original PS1 pixels (512x256), 2x, 3x, 4x (2048x1024, about 1080p). The game's line commands are
+   redrawn at N times the resolution with anti-aliasing (`Gpu::set_scale`, `vec.h`); screen clears, frame copies and
+   uploads are mirrored, and the normal VRAM the game reads is untouched. 1x output is unchanged and uses no extra memory.
+4. **START**. Settings are saved to `vibribbon-settings.ini` next to the exe and restored next time.
+
+Controls: mouse, or arrows/WASD + Enter, or controller D-pad + CROSS (START button = start). Drop `bios.bin` on the launcher
+to set the BIOS. In a game, **Esc or F1 returns to the launcher** (Esc in the launcher quits); F11 fullscreen; F10 tap filter.
+Giving a `.cue` on the command line skips the launcher.
+
+Cost per frame in my sandbox (software renderer): 1x about 4.7 ms, 2x about 6.6 ms, 4x about 13 ms of emulation + picture
+building, so 4x is the heavy setting; if it runs below 50 fps on your machine use 2x or 3x (the log's heartbeat shows fps).
+Not yet optimized (the picture is rebuilt every frame).
+
+Developer hook: `VIBRIBBON_EVENTS="drop=PATH;key=up;key=right;key=return;wait=300;key=escape;quit"` injects events (one per 10
+frames) so the whole app can be driven headlessly; `tests/launcher_test.cpp` renders the launcher to PPM files.
+
+## Launcher and upscaling
+
+Starting the app with no arguments opens the **launcher** (smooth vector line art, same style as the game):
+
+1. **Disc**: drop your `vibribbon.cue` on the window. It is checked straight away (must be the Vib-Ribbon EU disc).
+2. **Mods (optional)**: drop a `.zip` here. It is only validated and remembered; **mods are not supported yet**.
+3. **Upscale**: 1x = the original PS1 pixels, 2x / 3x / 4x = the game's lines redrawn smoothly at that multiple
+   (4x = 2048 x 1024, about 1080p). Then press **START**.
+
+Controls: mouse (click, hover), arrow keys / WASD + Enter (Tab cycles, Delete clears the mods zip), or a controller
+(D-pad + A, Start button). Drop `bios.bin` on the window if it is missing. **Esc** quits from the launcher and returns
+to the launcher from the game (F1 does the same). F11 = fullscreen.
+
+Your choices are saved in `vibribbon-settings.ini` next to the exe. `vibribbon.exe path\to\game.cue` still starts
+straight away (using the saved upscale).
+
+How the upscaling works (`gpu.h`, `vec.h`): the game's picture is made almost entirely of flat line segments (GP0
+`0x40`), a screen clear (`0x02`) and a frame copy (`0x80`). At 2x-4x the GPU keeps a second, N-times larger picture:
+every line is drawn into it again with smooth anti-aliased edges, and clears, copies and uploads are mirrored. The
+normal 1024x512 VRAM is still maintained exactly as before (the game reads from it), and 1x output is unchanged.
+Cost per frame in my sandbox: about 4.7 ms at 1x, 6.6 ms at 2x, 12.9 ms at 4x (budget 20 ms). If your machine cannot
+hold 50 fps at 4x, pick 2x or 3x.
+
+Developer hook: `VIBRIBBON_EVENTS="drop=PATH;key=right;key=return;wait=300;quit"` injects scripted events (one per
+10 frames) so the whole app can be driven headlessly. New tests: `gpu_hires_test`, `launcher_test`; tools
+`hires_shots` (screenshots + timing at a given scale) and `cmd_census` (which GPU commands the game uses).
+
 ## Run log (`vibribbon-log.txt`)
 
 The app writes a plain-text log next to the exe (`src/runlog.h`). It is saved every 5 seconds and again when you
@@ -136,6 +185,13 @@ close the window or press Esc, so a crash still leaves one behind. The previous 
 If something gets stuck, send `vibribbon-log.txt` and I can usually tell where.
 
 ## Still to do
+
+- The launcher has only been exercised with scripted events and screenshots (no real mouse/controller/GPU window yet).
+- Mods: the zip is accepted and remembered but not used.
+- Upscaled textures/polygons are mirrored block by block (only the language screen uses them); lines are the smooth part.
+- Upscale speed on real hardware is untested: 4x ran at ~39-44 fps in my software-rendered sandbox.
+- Optimize the upscaled path (dirty-rectangle picture building, SIMD fills) so 4x is cheap everywhere.
+- Mods: define what a mods zip contains and apply it.
 
 - `main.cpp` compiles cleanly with `-Wall -Wextra` against SDL 2.30 and was run headlessly with the dummy video/audio
   drivers (50 fps, log written, clean close); on-screen display and real keyboard/controller input are still unverified.

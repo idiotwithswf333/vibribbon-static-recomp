@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <map>
 #include <vector>
+#include "vec.h"
 
 namespace hw {
 
@@ -14,6 +15,22 @@ public:
     static constexpr int W = 1024, H = 512;
     std::vector<uint16_t> vram = std::vector<uint16_t>(W * H);
     std::map<uint32_t, uint64_t> cmd_hist;   // GP0 command byte -> count
+
+    // ---- upscaled output (1x = the original PS1 pixels; 2x..4x = smooth lines) ------------------------------------
+    // At scale > 1 a second, N-times larger picture ("hi") is kept next to the normal 1024x512 VRAM. The game still
+    // sees and uses the normal VRAM (reads, textures, copies), but every LINE it draws is also drawn into `hi`
+    // anti-aliased at N x the resolution, and screen clears, frame copies and uploads are mirrored there.
+    // display() then reads from `hi`. At scale 1 nothing changes and no extra memory is used.
+    float line_width = 1.0f;   // line thickness in original pixels (only used when scale > 1)
+    int scale() const { return scale_; }
+    void set_scale(int n) {
+        n = std::clamp(n, 1, 4);
+        if (n == scale_) return;
+        scale_ = n;
+        if (n == 1) { hi_.clear(); hi_.shrink_to_fit(); return; }
+        hi_.assign((size_t)W * n * H * n, 0xFF000000u);
+        for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) hi_pixel(x, y, vram[y * W + x]);   // start from what is in VRAM now
+    }
 
     // ---- register interface -------------------------------------------------
     std::vector<uint32_t>* gp0_log = nullptr;   // optional capture of every GP0 word (diagnostics)
@@ -70,6 +87,19 @@ public:
         static const int hr[4] = {256, 320, 512, 640};
         w = hres2_ ? 368 : hr[hres1_];
         h = vres_ ? (pal_ ? 512 : 480) : (pal_ ? 256 : 240);
+        if (scale_ > 1 && !depth24_) {   // upscaled picture: read straight from the hi-res mirror
+            const int n = scale_, WN = W * n, HN = H * n, ow = w * n, oh = h * n;
+            rgba.assign((size_t)ow * oh, 0xFF000000u);
+            if (!disp_off_)
+                for (int y = 0; y < oh; ++y) {
+                    const uint32_t* src = &hi_[(size_t)((disp_y_ * n + y) % HN) * WN];
+                    uint32_t* dst = &rgba[(size_t)y * ow];
+                    if (disp_x_ * n + ow <= WN) std::copy(src + disp_x_ * n, src + disp_x_ * n + ow, dst);   // the normal case: one straight copy
+                    else for (int x = 0; x < ow; ++x) dst[x] = src[(disp_x_ * n + x) % WN];
+                }
+            w = ow; h = oh;
+            return;
+        }
         rgba.assign((size_t)w * h, 0xFF000000u);
         if (disp_off_) return;
         for (int y = 0; y < h; ++y) {
@@ -109,6 +139,8 @@ private:
     // display state
     int disp_x_ = 0, disp_y_ = 0, hres1_ = 1, hres2_ = 0, vres_ = 0, pal_ = 1, depth24_ = 0, interlace_ = 1;
     int disp_off_ = 1, dma_dir_ = 0, field_ = 0;
+    // upscaled mirror (see set_scale)
+    int scale_ = 1; std::vector<uint32_t> hi_, copy_tmp_; bool rec_ = false;   // rec_: mirror each native put() (polygons and rectangles)
 
     void reset() {
         fifo_.clear(); xfer_in_ = xfer_out_ = poly_ = false;
@@ -154,6 +186,7 @@ private:
             int w = (((fifo_[2] & 0x3FF) + 0xF) & ~0xF), h = (fifo_[2] >> 16) & 0x1FF;
             uint16_t c = rgb15(fifo_[0] & 0xFF, (fifo_[0] >> 8) & 0xFF, (fifo_[0] >> 16) & 0xFF);
             for (int j = 0; j < h; ++j) for (int i = 0; i < w; ++i) vram[((y + j) & (H - 1)) * W + ((x + i) & (W - 1))] = c;
+            if (scale_ > 1) hi_fill(x, y, w, h, c);
             break; }
         case 0xE1: { uint32_t w = fifo_[0]; tpx_ = (w & 0xF) * 64; tpy_ = ((w >> 4) & 1) * 256; semi_ = (w >> 5) & 3;
                      depth_ = (w >> 7) & 3; dither_ = (w >> 9) & 1; draw_to_display_ = (w >> 10) & 1; tex_disable_ = (w >> 11) & 1; break; }
@@ -169,6 +202,7 @@ private:
             int w = ((((fifo_[3] & 0x3FF) - 1) & 0x3FF) + 1), h = ((((fifo_[3] >> 16) & 0x1FF) - 1) & 0x1FF) + 1;
             for (int j = 0; j < h; ++j) for (int i = 0; i < w; ++i)
                 vram[((dy + j) & (H - 1)) * W + ((dx + i) & (W - 1))] = vram[((sy + j) & (H - 1)) * W + ((sx + i) & (W - 1))];
+            if (scale_ > 1) hi_copy(sx, sy, dx, dy, w, h);   // copy the hi-res picture too (keeps the smooth lines)
             return; }
         if (cmd >= 0xA0 && cmd <= 0xBF) {
             ix_ = fifo_[1] & 0x3FF; iy_ = (fifo_[1] >> 16) & 0x1FF;
@@ -182,8 +216,68 @@ private:
     void feed_xfer(uint32_t w) {
         for (int i = 0; i < 2 && xfer_in_; ++i) {
             vram[((iy_ + icy_) & (H - 1)) * W + ((ix_ + icx_) & (W - 1))] = (uint16_t)(w >> (16 * i));
+            if (scale_ > 1) hi_pixel((ix_ + icx_) & (W - 1), (iy_ + icy_) & (H - 1), (uint16_t)(w >> (16 * i)));
             if (++icx_ >= iw_) { icx_ = 0; if (++icy_ >= ih_) xfer_in_ = false; }
         }
+    }
+
+    // ---- upscaled mirror helpers ---------------------------------------------------------------------------------
+    static uint32_t px32(uint16_t p) {   // 15-bit colour -> 0xAABBGGRR with proper 5->8 bit expansion (white = 255)
+        auto e = [](int v) { return (uint32_t)((v << 3) | (v >> 2)); };
+        return 0xFF000000u | e((p >> 10) & 31) << 16 | e((p >> 5) & 31) << 8 | e(p & 31);
+    }
+    void hi_pixel(int x, int y, uint16_t p) {   // one native pixel -> an N x N block
+        const int n = scale_, WN = W * n; const uint32_t c = px32(p);
+        for (int j = 0; j < n; ++j) { uint32_t* row = &hi_[(size_t)(y * n + j) * WN + (size_t)x * n]; for (int i = 0; i < n; ++i) row[i] = c; }
+    }
+    void hi_fill(int x, int y, int w, int h, uint16_t p) {
+        const int n = scale_, WN = W * n, HN = H * n; const uint32_t c = px32(p);
+        for (int j = 0; j < h * n; ++j) {
+            uint32_t* row = &hi_[(size_t)(((y * n + j) % HN)) * WN];
+            if (x * n + w * n <= WN) std::fill(row + x * n, row + x * n + w * n, c);
+            else for (int i = 0; i < w * n; ++i) row[(x * n + i) % WN] = c;
+        }
+    }
+    void hi_copy(int sx, int sy, int dx, int dy, int w, int h) {
+        const int n = scale_, WN = W * n, HN = H * n, bw = w * n, bh = h * n;
+        copy_tmp_.resize((size_t)bw * bh);   // reused every frame: no allocation
+        const bool s_ok = sx * n + bw <= WN, d_ok = dx * n + bw <= WN;
+        for (int j = 0; j < bh; ++j) {
+            const uint32_t* src = &hi_[(size_t)((sy * n + j) % HN) * WN];
+            uint32_t* t = &copy_tmp_[(size_t)j * bw];
+            if (s_ok) std::copy(src + sx * n, src + sx * n + bw, t); else for (int i = 0; i < bw; ++i) t[i] = src[(sx * n + i) % WN];
+        }
+        for (int j = 0; j < bh; ++j) {
+            uint32_t* dst = &hi_[(size_t)((dy * n + j) % HN) * WN];
+            const uint32_t* t = &copy_tmp_[(size_t)j * bw];
+            if (d_ok) std::copy(t, t + bw, dst + dx * n); else for (int i = 0; i < bw; ++i) dst[(dx * n + i) % WN] = t[i];
+        }
+    }
+    // A smooth line into the mirror. (x0,y0)-(x1,y1) are native pixel coordinates (draw offset already applied).
+    void hi_line(int x0, int y0, uint32_t c0, int x1, int y1, uint32_t c1, bool gour, bool semi) {
+        const int n = scale_, WN = W * n;
+        const float f = (float)n;
+        const int cx0 = std::max(clip_x1_, 0) * n, cx1 = std::min(clip_x2_ + 1, W) * n;
+        const int cy0 = std::max(clip_y1_, 0) * n, cy1 = std::min(clip_y2_ + 1, H) * n;
+        if (cx0 >= cx1 || cy0 >= cy1) return;
+        vec::aa_line((x0 + 0.5f) * f, (y0 + 0.5f) * f, (x1 + 0.5f) * f, (y1 + 0.5f) * f, 0.5f * f * line_width, cx0, cy0, cx1, cy1,
+            [&](int px, int py, float cov, float t) {
+                int sr = c0 & 0xFF, sg = (c0 >> 8) & 0xFF, sb = (c0 >> 16) & 0xFF;
+                if (gour) { sr += (int)(((int)(c1 & 0xFF) - sr) * t); sg += (int)(((int)((c1 >> 8) & 0xFF) - sg) * t); sb += (int)(((int)((c1 >> 16) & 0xFF) - sb) * t); }
+                uint32_t& d = hi_[(size_t)py * WN + px];
+                int dr = d & 0xFF, dg = (d >> 8) & 0xFF, db = (d >> 16) & 0xFF;
+                if (semi) {   // same four blend modes as the native put()
+                    switch (semi_) {
+                    case 0: sr = (dr + sr) / 2; sg = (dg + sg) / 2; sb = (db + sb) / 2; break;
+                    case 1: sr = dr + sr; sg = dg + sg; sb = db + sb; break;
+                    case 2: sr = dr - sr; sg = dg - sg; sb = db - sb; break;
+                    default: sr = dr + sr / 4; sg = dg + sg / 4; sb = db + sb / 4; break;
+                    }
+                    sr = std::clamp(sr, 0, 255); sg = std::clamp(sg, 0, 255); sb = std::clamp(sb, 0, 255);
+                }
+                const int r = dr + (int)((sr - dr) * cov + 0.5f), g = dg + (int)((sg - dg) * cov + 0.5f), b = db + (int)((sb - db) * cov + 0.5f);
+                d = 0xFF000000u | (uint32_t)b << 16 | (uint32_t)g << 8 | (uint32_t)r;
+            });
     }
 
     static uint16_t rgb15(int r, int g, int b) { return (uint16_t)((r >> 3) | (g >> 3) << 5 | (b >> 3) << 10); }
@@ -206,6 +300,7 @@ private:
             c = (uint16_t)(std::clamp(r, 0, 31) | std::clamp(g, 0, 31) << 5 | std::clamp(b, 0, 31) << 10);
         }
         dst = c | (mask_set_ ? 0x8000 : 0);
+        if (rec_) hi_pixel(x, y, dst);   // polygons/rectangles: mirrored block by block
     }
 
     // texture fetch; returns false for fully transparent texels
@@ -245,8 +340,10 @@ private:
                 if (i == 1) { tpx_ = (t >> 16 & 0xF) * 64; tpy_ = ((t >> 20) & 1) * 256; semi_ = (t >> 21) & 3; depth_ = (t >> 23) & 3; }
             }
         }
+        rec_ = scale_ > 1;
         tri(v[0], v[1], v[2], tex, semi, raw, clutx, cluty);
         if (quad) tri(v[1], v[2], v[3], tex, semi, raw, clutx, cluty);
+        rec_ = false;
     }
     static int64_t edge(const V& a, const V& b, int px, int py) { return (int64_t)(b.x - a.x) * (py - a.y) - (int64_t)(b.y - a.y) * (px - a.x); }
     void tri(V a, V b, V c, bool tex, bool semi, bool raw, int clutx, int cluty) {
@@ -281,15 +378,18 @@ private:
         if (sz == 0) { uint32_t wh = fifo_[idx++]; w = wh & 0x3FF; h = (wh >> 16) & 0x1FF; }
         else if (sz == 1) w = h = 1; else if (sz == 2) w = h = 8; else w = h = 16;
         int r = col & 0xFF, g = (col >> 8) & 0xFF, b = (col >> 16) & 0xFF;
+        rec_ = scale_ > 1;
         for (int j = 0; j < h; ++j) for (int i = 0; i < w; ++i) {
             if (tex) { uint16_t t; if (!texel(u0 + i, v0 + j, clutx, cluty, t)) continue; put(x + i, y + j, modulate(t, r, g, b, raw), semi && (t & 0x8000)); }
             else put(x + i, y + j, rgb15(r, g, b), semi);
         }
+        rec_ = false;
     }
     void line_seg(int x0, int y0, uint32_t c0, int x1, int y1, uint32_t c1, bool gour, bool semi) {
         x0 += off_x_; y0 += off_y_; x1 += off_x_; y1 += off_y_;
         int dx = x1 - x0, dy = y1 - y0, n = std::max(std::abs(dx), std::abs(dy));
         if (std::abs(dx) > 1023 || std::abs(dy) > 511) return;
+        if (scale_ > 1) hi_line(x0, y0, c0, x1, y1, c1, gour, semi);   // smooth version for the upscaled picture
         for (int i = 0; i <= n; ++i) {
             int x = n ? x0 + dx * i / n : x0, y = n ? y0 + dy * i / n : y0;
             int r = c0 & 0xFF, g = (c0 >> 8) & 0xFF, b = (c0 >> 16) & 0xFF;

@@ -47,3 +47,11 @@ add_executable(runlog_test tests/runlog_test.cpp)   # unit test for the run log
 add_executable(cdvol_watch tests/cdvol_watch.cpp)   # cdvol_watch bios cue "w1500 X w400 X ..." -- logs SPU CD volume / CD play+mute changes
 add_executable(spu_reverb_test tests/spu_reverb_test.cpp)   # reverb unit as a PCM player (how the game plays its music)
 add_executable(music_timeline tests/music_timeline.cpp)    # music_timeline bios cue [out.wav] -- Bronze level output level over time, with a pause
+add_executable(gpu_hires_test tests/gpu_hires_test.cpp)   # upscaled (2x-4x) smooth-line mode of the GPU
+add_executable(launcher_test tests/launcher_test.cpp)     # launcher_test [game.cue] [out_prefix] -- launcher logic + renders screenshots
+add_executable(hires_shots tests/hires_shots.cpp)         # hires_shots bios cue scale out_prefix -- game screens + per-frame cost at 1x-4x
+add_executable(cmd_census tests/cmd_census.cpp)           # which GPU commands the game uses on each screen
+add_executable(gpu_hires_test tests/gpu_hires_test.cpp)   # upscaled (2x-4x) line mode of the GPU
+add_executable(launcher_test tests/launcher_test.cpp)     # launcher_test [game.cue] [out_prefix] -- model tests + screenshots
+add_executable(hires_shots tests/hires_shots.cpp)         # hires_shots bios cue scale out_prefix -- screenshots + timing
+add_executable(cmd_census tests/cmd_census.cpp)           # which GP0 commands the game uses

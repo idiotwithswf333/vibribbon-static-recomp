@@ -8,7 +8,11 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <iterator>
+#include <sstream>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -17,6 +21,7 @@
 
 #include "cpu.h"
 #include "disc.h"
+#include "glow.h"
 #include <initializer_list>
 #include "pad_map.h"
 #include "launcher.h"
@@ -111,6 +116,36 @@ uint64_t hash_pixels(const std::vector<uint32_t>& p) {   // cheap fingerprint of
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < p.size(); i += 13) { h ^= p[i]; h *= 1099511628211ull; }
     return h;
+}
+
+// ---- Feature: fast-forward. Hold TAB (keyboard) or press the right stick (controller): the game runs 4 frames per shown frame, sound muted.
+constexpr int kFastForwardSteps = 4;
+bool fast_forward_held() {
+    if (SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_TAB]) return true;
+    return g_pad && SDL_GameControllerGetButton(g_pad, SDL_CONTROLLER_BUTTON_RIGHTSTICK) != 0;
+}
+
+// ---- Feature: screenshots. F12 saves the current game picture as a BMP in a "screenshots" folder next to the exe.
+// Returns the saved path, or "" on failure. Saves at the current upscale (so 4x gives a 2048 x 1024 picture).
+std::string save_screenshot(const std::string& exe_dir, const std::vector<uint32_t>& px, int w, int h) {
+    if (w <= 0 || h <= 0 || px.size() < (size_t)w * (size_t)h) return "";
+    std::error_code ec;
+    std::filesystem::path dir = std::filesystem::path(exe_dir) / "screenshots";
+    std::filesystem::create_directories(dir, ec);
+    std::time_t t = std::time(nullptr); std::tm tmv{};
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    char stamp[48]; std::strftime(stamp, sizeof stamp, "vibribbon-%Y%m%d-%H%M%S", &tmv);
+    std::filesystem::path file = dir / (std::string(stamp) + ".bmp");
+    for (int n = 2; std::filesystem::exists(file, ec) && n < 100; ++n) file = dir / (std::string(stamp) + "-" + std::to_string(n) + ".bmp");
+    SDL_Surface* s = SDL_CreateRGBSurfaceWithFormatFrom((void*)px.data(), w, h, 32, w * 4, SDL_PIXELFORMAT_ABGR8888);
+    if (!s) return "";
+    const int rc = SDL_SaveBMP(s, file.string().c_str());
+    SDL_FreeSurface(s);
+    return rc == 0 ? file.string() : "";
 }
 
 // One running game. The disc image must outlive the CPU that reads from it.
@@ -231,6 +266,7 @@ int main(int argc, char** argv) {
     int tex_w = 0, tex_h = 0;
     std::vector<uint32_t> pixels;
     bool fullscreen = false;
+    bool neon = false;   // neon glow (bloom): starts from the launcher checkbox, F9 toggles it in game
     uint32_t frames = 0, last_title = SDL_GetTicks();
 
     // Run statistics for the log.
@@ -296,6 +332,8 @@ int main(int argc, char** argv) {
         g_log.note("Loading disc: %s (upscale %dx)", cue.c_str(), lm.s.upscale);
         std::string msg = boot_disc(cue, emu);
         if (emu.cpu) emu.cpu->gpu.set_scale(lm.s.upscale);
+        neon = lm.s.glow;
+        g_log.note("Options: neon glow %s, fast-forward %s, screenshots %s", lm.s.glow ? "on" : "off", lm.s.ffwd ? "on" : "off", lm.s.shot ? "on" : "off");
         g_log.note("BIOS in use: %s", g_bios.empty() ? "none found" : g_bios.c_str());
         g_log.note("Boot result: %s", msg.empty() ? "started OK" : msg.c_str());
         last_halt = "no"; hb_last = SDL_GetTicks(); hb_frames = 0; same_hash = 0; last_hash = 0; last_vblanks = 0;
@@ -318,6 +356,7 @@ int main(int argc, char** argv) {
     if (const char* ev = std::getenv("VIBRIBBON_EVENTS")) { std::stringstream ss(ev); for (std::string t; std::getline(ss, t, ';');) scripted.push_back(t); }
     size_t script_i = 0; int script_wait = 30;
 
+    bool ff_now = false;   // fast-forward currently held
     for (bool running = true; running;) {
         uint32_t frame_start = SDL_GetTicks();
         if (script_i < scripted.size() && script_wait-- <= 0) {   // scripted (developer) events
@@ -390,6 +429,18 @@ int main(int argc, char** argv) {
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) {   // Esc: game -> launcher, launcher -> quit
                 if (mode == Mode::Game) go_launcher(""); else { running = false; g_log.note("Esc pressed: closing"); }
             }
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F9) {   // neon glow on/off
+                neon = !neon;
+                SDL_SetWindowTitle(win, neon ? "Neon glow ON (F9)" : "Neon glow OFF (F9)"); warn_until = SDL_GetTicks() + 2000;
+                g_log.note("Neon glow turned %s (F9)", neon ? "ON" : "OFF");
+            }
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F12 && mode == Mode::Game && emu.cpu && lm.s.shot) {   // screenshot
+                int sw = 0, sh = 0; emu.cpu->gpu.display(pixels, sw, sh); if (neon) glow::apply(pixels, sw, sh);
+                const std::string saved_to = save_screenshot(exe_dir, pixels, sw, sh);
+                char t[300]; std::snprintf(t, sizeof t, saved_to.empty() ? "Screenshot FAILED (folder not writable?)" : "Screenshot saved: %s", saved_to.c_str());
+                SDL_SetWindowTitle(win, t); warn_until = SDL_GetTicks() + 3000;
+                g_log.note("%s", t);
+            }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F10) {
                 g_tap.enabled = !g_tap.enabled;
                 std::fprintf(stderr, "D-pad tap filter %s\n", g_tap.enabled ? "ON" : "OFF");
@@ -440,7 +491,11 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "pad: %04X\n", last_pad);
                 g_log.noisy("Buttons sent to the game: %s", pad_names(last_pad).c_str());
             }
+            ff_now = lm.s.ffwd && fast_forward_held();
+            bool stopped = false;
+            for (int step = 0; step < (ff_now ? kFastForwardSteps : 1) && !stopped; ++step) {
             if (!emu.cpu->run_frame() && emu.cpu->halted) {
+                stopped = true;
                 std::string m = "CPU stopped: " + emu.cpu->halt_reason;
                 SDL_SetWindowTitle(win, m.c_str());
                 std::fprintf(stderr, "%s\n", m.c_str());
@@ -453,11 +508,16 @@ int main(int argc, char** argv) {
                 // the game WAITS on both (e.g. "has the sound effect finished?", "has the CD reached the track?").
                 // So this must run once per video frame even when there is no sound device or the queue is full.
                 emu.cpu->audio_frame(kAudioFrames, audio_buf.data());
-                // Keep the queue shallow (~100 ms) so sound stays in sync with the picture.
-                if (audio && SDL_GetQueuedAudioSize(audio) < (Uint32)kAudioFrames * 4 * 5)
+                // Keep the queue shallow (~100 ms) so sound stays in sync with the picture. Silent while fast-forwarding.
+                if (ff_now) { if (audio) SDL_ClearQueuedAudio(audio); }
+                else if (audio && SDL_GetQueuedAudioSize(audio) < (Uint32)kAudioFrames * 4 * 5)
                     SDL_QueueAudio(audio, audio_buf.data(), (Uint32)audio_buf.size() * 2);
+            }
+            }
+            if (!stopped) {
                 int w = 0, h = 0;
                 emu.cpu->gpu.display(pixels, w, h);
+                if (neon) glow::apply(pixels, w, h);
                 if (!tex || w != tex_w || h != tex_h) {
                     if (tex) SDL_DestroyTexture(tex);
                     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, emu.cpu->gpu.scale() > 1 ? "linear" : "nearest");   // 1x stays crisp pixels
@@ -474,7 +534,7 @@ int main(int argc, char** argv) {
         uint32_t now = SDL_GetTicks();
         if (emu.cpu && now - last_title >= 1000 && now > warn_until) {   // FPS in the title bar
             char t[160];
-            std::snprintf(t, sizeof t, "Vib-Ribbon - %u fps (target 50) | %ux | Esc launcher | F10 tap filter: %s", frames, emu.cpu->gpu.scale(), g_tap.enabled ? "ON" : "OFF");
+            std::snprintf(t, sizeof t, "Vib-Ribbon - %u fps%s | %ux | Esc launcher | F9 glow | F12 screenshot | hold Tab fast-forward | F10 tap filter: %s", frames, ff_now ? " FAST-FORWARD" : " (target 50)", emu.cpu->gpu.scale(), g_tap.enabled ? "ON" : "OFF");
             SDL_SetWindowTitle(win, t);
             frames = 0; last_title = now;
         }
@@ -507,8 +567,8 @@ int main(int argc, char** argv) {
         }
         // Hold the PAL 50 Hz pace; if emulation is slower than that we simply run flat out.
         uint32_t spent = SDL_GetTicks() - frame_start;
-        if (emu.cpu && spent > 40) { ++slow_frames; max_frame_ms = std::max(max_frame_ms, spent); }
-        if (emu.cpu && spent < 20) SDL_Delay(20 - spent);
+        if (emu.cpu && !ff_now && spent > 40) { ++slow_frames; max_frame_ms = std::max(max_frame_ms, spent); }
+        if (emu.cpu && !ff_now && spent < 20) SDL_Delay(20 - spent);
         else if (!emu.cpu) SDL_Delay(16);
     }
     launcher::save_settings(settings_path, lm.s);

@@ -19,6 +19,10 @@ int main(int argc, char** argv) {
         CHECK(launcher::save_settings(f, s));
         launcher::Settings t; CHECK(launcher::load_settings(f, t));
         CHECK(t.cue == s.cue && t.mods == s.mods && t.upscale == 3);
+        CHECK(!t.glow && t.ffwd && t.shot);                                                  // option defaults survive a round trip
+        s.glow = true; s.ffwd = false; s.shot = false; CHECK(launcher::save_settings(f, s));
+        launcher::Settings t2; CHECK(launcher::load_settings(f, t2)); CHECK(t2.glow && !t2.ffwd && !t2.shot);
+        std::ofstream(f) << "cue=x\n"; launcher::Settings old; launcher::load_settings(f, old); CHECK(!old.glow && old.ffwd && old.shot);   // old ini without the keys
         std::ofstream(f) << "upscale=99\ncue=x\n"; launcher::Settings u; launcher::load_settings(f, u); CHECK(u.upscale == 4);   // clamped
         launcher::Settings none; CHECK(!launcher::load_settings((d / "missing.ini").string(), none) && none.upscale == 1);
     }
@@ -54,9 +58,19 @@ int main(int argc, char** argv) {
         m.nav(0, 1); CHECK(m.focus == launcher::F_UP1);                                     // down from mods -> the selected size's chip
         m.nav(1, 0); CHECK(m.focus == launcher::F_UP2 && m.s.upscale == 2);                 // moving over chips selects them
         m.nav(1, 0); m.nav(1, 0); m.nav(1, 0); CHECK(m.focus == launcher::F_UP4 && m.s.upscale == 4);   // clamped at 4x
+        m.nav(0, 1); CHECK(m.focus == launcher::F_OPT_GLOW);                                // down from the sizes -> the option check boxes
+        m.nav(1, 0); CHECK(m.focus == launcher::F_OPT_FF);
+        m.nav(1, 0); m.nav(1, 0); CHECK(m.focus == launcher::F_OPT_SHOT);                   // clamped at the last box
         m.nav(0, 1); CHECK(m.focus == launcher::F_START);
+        m.nav(0, -1); CHECK(m.focus == launcher::F_OPT_GLOW);
         m.nav(0, -1); CHECK(m.focus == launcher::F_UP4);
         m.nav(0, -1); CHECK(m.focus == launcher::F_MODS);                                   // up from a right-hand chip -> mods
+        CHECK(!m.s.glow && m.s.ffwd && m.s.shot);                                           // defaults: glow off, fast-forward + screenshots on
+        m.activate(launcher::F_OPT_GLOW); CHECK(m.s.glow && m.focus == launcher::F_OPT_GLOW);   // activating a box toggles it
+        m.activate(launcher::F_OPT_FF); CHECK(!m.s.ffwd);
+        m.activate(launcher::F_OPT_SHOT); CHECK(!m.s.shot);
+        m.activate(launcher::F_OPT_FF); CHECK(m.s.ffwd);
+        { auto o = launcher::shape_of(launcher::F_OPT_SHOT); CHECK(launcher::hit_test(m, o.cx, o.cy) == launcher::F_OPT_SHOT); }
         m.activate(launcher::F_UP1); CHECK(m.s.upscale == 1);
         m.activate(launcher::F_CLEAR); CHECK(m.s.mods.empty() && !m.zip.ok);
         m.activate(launcher::F_START); CHECK(m.start_requested);

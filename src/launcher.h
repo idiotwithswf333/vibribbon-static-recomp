@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -23,6 +24,9 @@ constexpr int kW = 1920, kH = 1080;   // the launcher canvas (scaled to the wind
 struct Settings {
     std::string cue, mods;
     int upscale = 1;   // 1 = original PS1 pixels ... 4 = ~1080p lines
+    bool glow = false;   // neon glow (bloom) on at start (F9 still toggles it in game)
+    bool ffwd = true;    // hold Tab / right stick to fast-forward
+    bool shot = true;    // F12 saves a screenshot
 };
 
 inline bool load_settings(const std::string& path, Settings& s) {
@@ -37,6 +41,9 @@ inline bool load_settings(const std::string& path, Settings& s) {
         if (k == "cue") s.cue = v;
         else if (k == "mods") s.mods = v;
         else if (k == "upscale") s.upscale = std::clamp(std::atoi(v.c_str()), 1, 4);
+        else if (k == "glow") s.glow = std::atoi(v.c_str()) != 0;
+        else if (k == "fastforward") s.ffwd = std::atoi(v.c_str()) != 0;
+        else if (k == "screenshots") s.shot = std::atoi(v.c_str()) != 0;
     }
     return true;
 }
@@ -44,7 +51,8 @@ inline bool save_settings(const std::string& path, const Settings& s) {
     std::ofstream f(path, std::ios::trunc);
     if (!f) return false;
     f << "# Vib-Ribbon recomp launcher settings (edited by the launcher; safe to delete)\n"
-      << "cue=" << s.cue << "\nmods=" << s.mods << "\nupscale=" << std::clamp(s.upscale, 1, 4) << "\n";
+      << "cue=" << s.cue << "\nmods=" << s.mods << "\nupscale=" << std::clamp(s.upscale, 1, 4) << "\n"
+      << "glow=" << (s.glow ? 1 : 0) << "\nfastforward=" << (s.ffwd ? 1 : 0) << "\nscreenshots=" << (s.shot ? 1 : 0) << "\n";
     return true;
 }
 
@@ -93,7 +101,7 @@ inline ZipCheck check_zip(const std::string& path) {
 }
 
 // ---- the model ----------------------------------------------------------------------------------------------------
-enum Focus { F_DISC = 0, F_MODS, F_UP1, F_UP2, F_UP3, F_UP4, F_START, F_COUNT, F_CLEAR = 100, F_NONE = -1 };
+enum Focus { F_DISC = 0, F_MODS, F_UP1, F_UP2, F_UP3, F_UP4, F_OPT_GLOW, F_OPT_FF, F_OPT_SHOT, F_START, F_COUNT, F_CLEAR = 100, F_NONE = -1 };
 
 struct Model {
     Settings s;
@@ -132,17 +140,27 @@ struct Model {
     }
     void clear_mods() { s.mods.clear(); zip = ZipCheck(); say("MODS CLEARED"); }
     void set_upscale(int n) { s.upscale = std::clamp(n, 1, 4); }
+    static bool is_opt(int f) { return f >= F_OPT_GLOW && f <= F_OPT_SHOT; }
+    bool& opt_ref(int f) { return f == F_OPT_GLOW ? s.glow : (f == F_OPT_FF ? s.ffwd : s.shot); }
+    void toggle_opt(int f) {
+        bool& b = opt_ref(f); b = !b;
+        static const char* names[3] = {"NEON GLOW", "FAST-FORWARD", "SCREENSHOTS"};
+        say(std::string(names[f - F_OPT_GLOW]) + (b ? " ON" : " OFF"), 120);
+    }
 
     // Keyboard / controller navigation: dx, dy in {-1,0,1}. Left/right over the upscale chips also picks that size.
     void nav(int dx, int dy) {
         if (focus >= F_UP1 && focus <= F_UP4 && dx) { focus = std::clamp(focus + dx, (int)F_UP1, (int)F_UP4); set_upscale(focus - F_UP1 + 1); return; }
+        if (is_opt(focus) && dx) { focus = std::clamp(focus + dx, (int)F_OPT_GLOW, (int)F_OPT_SHOT); return; }
         if (focus == F_DISC && dx > 0) { focus = F_MODS; return; }
         if (focus == F_MODS && dx < 0) { focus = F_DISC; return; }
         if (dy > 0) {
             if (focus == F_DISC || focus == F_MODS) focus = F_UP1 + s.upscale - 1;
-            else if (focus >= F_UP1 && focus <= F_UP4) focus = F_START;
+            else if (focus >= F_UP1 && focus <= F_UP4) focus = F_OPT_GLOW;
+            else if (is_opt(focus)) focus = F_START;
         } else if (dy < 0) {
-            if (focus == F_START) focus = F_UP1 + s.upscale - 1;
+            if (focus == F_START) focus = F_OPT_GLOW;
+            else if (is_opt(focus)) focus = F_UP1 + s.upscale - 1;
             else if (focus >= F_UP1 && focus <= F_UP4) focus = (focus <= F_UP2) ? F_DISC : F_MODS;
         }
     }
@@ -151,6 +169,7 @@ struct Model {
         focus = f == F_CLEAR ? (int)F_MODS : f;
         if (f == F_START) { if (can_start()) start_requested = true; else say("DROP YOUR VIB-RIBBON .CUE FILE FIRST"); }
         else if (f >= F_UP1 && f <= F_UP4) set_upscale(f - F_UP1 + 1);
+        else if (is_opt(f)) toggle_opt(f);
         else if (f == F_CLEAR) clear_mods();
         else if (f == F_DISC) say("DRAG YOUR .CUE FILE ONTO THIS WINDOW");
         else if (f == F_MODS) say("DRAG A MODS .ZIP ONTO THIS WINDOW (OPTIONAL)");
@@ -161,19 +180,22 @@ struct Model {
 struct Ellipse { float cx, cy, rx, ry; };
 inline Ellipse shape_of(int f) {
     switch (f) {
-    case F_DISC: return {520, 445, 400, 120};
-    case F_MODS: return {1400, 445, 400, 120};
-    case F_UP1: return {585, 680, 105, 48};
-    case F_UP2: return {835, 680, 105, 48};
-    case F_UP3: return {1085, 680, 105, 48};
-    case F_UP4: return {1335, 680, 105, 48};
-    case F_START: return {960, 893, 330, 86};
-    case F_CLEAR: return {1862, 445, 40, 30};
+    case F_DISC: return {520, 385, 400, 102};
+    case F_MODS: return {1400, 385, 400, 102};
+    case F_UP1: return {585, 600, 105, 44};
+    case F_UP2: return {835, 600, 105, 44};
+    case F_UP3: return {1085, 600, 105, 44};
+    case F_UP4: return {1335, 600, 105, 44};
+    case F_OPT_GLOW: return {420, 825, 260, 44};
+    case F_OPT_FF: return {960, 825, 260, 44};
+    case F_OPT_SHOT: return {1500, 825, 260, 44};
+    case F_START: return {960, 942, 330, 58};
+    case F_CLEAR: return {1862, 385, 40, 30};
     default: return {0, 0, 1, 1};
     }
 }
 inline int hit_test(const Model& m, float x, float y) {
-    for (int f : {(int)F_CLEAR, (int)F_START, (int)F_UP1, (int)F_UP2, (int)F_UP3, (int)F_UP4, (int)F_DISC, (int)F_MODS}) {
+    for (int f : {(int)F_CLEAR, (int)F_START, (int)F_OPT_GLOW, (int)F_OPT_FF, (int)F_OPT_SHOT, (int)F_UP1, (int)F_UP2, (int)F_UP3, (int)F_UP4, (int)F_DISC, (int)F_MODS}) {
         if (f == F_CLEAR && m.s.mods.empty()) continue;
         Ellipse e = shape_of(f);
         float a = (x - e.cx) / e.rx, b = (y - e.cy) / e.ry;
@@ -203,7 +225,7 @@ inline void draw(vec::Canvas& cv, const Model& m, int frame = 0) {
 
     // a ribbon with every obstacle (loop, wave, pit, block), across the top: the game's own motif
     {
-        std::vector<std::pair<float, float>> r; float x = 140, y = 250;
+        std::vector<std::pair<float, float>> r; float x = 140, y = 232;
         auto go = [&](float dx, float dy) { x += dx; y += dy; r.push_back({x, y}); };
         r.push_back({x, y}); go(430, 0);
         { const float R = 44.0f, c = 15.0f, x0 = x, y0 = y;   // loop: a prolate cycloid that crosses itself
@@ -229,13 +251,13 @@ inline void draw(vec::Canvas& cv, const Model& m, int frame = 0) {
         Ellipse e = shape_of(F_DISC);
         const bool have = !m.s.cue.empty();
         bubble(F_DISC, m.disc.ok ? GREEN : (have ? RED : WHITE), 3.5f);
-        vec::text(cv, e.cx, e.cy - 90, 4, "1  DISC", DIM, 2.5f, 1);
+        vec::text(cv, e.cx, e.cy - 64, 3.6f, "1  DISC", DIM, 2.3f, 1);
         if (!have) {
-            vec::text(cv, e.cx, e.cy - 38, 6, "DROP YOUR .CUE", WHITE, 3.5f, 1);
-            vec::text(cv, e.cx, e.cy + 20, 6, "ON THIS WINDOW", WHITE, 3.5f, 1);
+            vec::text(cv, e.cx, e.cy - 30, 6, "DROP YOUR .CUE", WHITE, 3.5f, 1);
+            vec::text(cv, e.cx, e.cy + 28, 6, "ON THIS WINDOW", WHITE, 3.5f, 1);
         } else {
-            { std::string n = upper(file_name(m.s.cue)); vec::text(cv, e.cx, e.cy - 38, fit(n, 6, 680), n, WHITE, 3.5f, 1); }
-            vec::text(cv, e.cx, e.cy + 28, fit(m.disc.msg, 4, 640), m.disc.msg, m.disc.ok ? GREEN : RED, 2.5f, 1);
+            { std::string n = upper(file_name(m.s.cue)); vec::text(cv, e.cx, e.cy - 30, fit(n, 6, 680), n, WHITE, 3.5f, 1); }
+            vec::text(cv, e.cx, e.cy + 36, fit(m.disc.msg, 4, 640), m.disc.msg, m.disc.ok ? GREEN : RED, 2.5f, 1);
         }
     }
     // ---- 2: mods ----
@@ -243,14 +265,14 @@ inline void draw(vec::Canvas& cv, const Model& m, int frame = 0) {
         Ellipse e = shape_of(F_MODS);
         const bool have = !m.s.mods.empty();
         bubble(F_MODS, have ? (m.zip.ok ? VIOLET : RED) : WHITE, 3.5f);
-        vec::text(cv, e.cx, e.cy - 90, 4, "2  MODS (OPTIONAL)", DIM, 2.5f, 1);
+        vec::text(cv, e.cx, e.cy - 64, 3.6f, "2  MODS (OPTIONAL)", DIM, 2.3f, 1);
         if (!have) {
-            vec::text(cv, e.cx, e.cy - 38, 6, "DROP A MODS .ZIP", WHITE, 3.5f, 1);
-            vec::text(cv, e.cx, e.cy + 28, 4, "OPTIONAL - NO MODS YET", DIM, 2.5f, 1);
+            vec::text(cv, e.cx, e.cy - 30, 6, "DROP A MODS .ZIP", WHITE, 3.5f, 1);
+            vec::text(cv, e.cx, e.cy + 36, 4, "OPTIONAL - NO MODS YET", DIM, 2.5f, 1);
         } else {
-            { std::string n = upper(file_name(m.s.mods)); vec::text(cv, e.cx, e.cy - 38, fit(n, 6, 560), n, WHITE, 3.5f, 1); }
-            vec::text(cv, e.cx, e.cy + 20, fit(m.zip.msg, 4, 560), m.zip.msg, m.zip.ok ? VIOLET : RED, 2.5f, 1);
-            if (m.zip.ok) vec::text(cv, e.cx, e.cy + 58, 3.4f, "NOT SUPPORTED YET", DIM, 2.2f, 1);
+            { std::string n = upper(file_name(m.s.mods)); vec::text(cv, e.cx, e.cy - 30, fit(n, 6, 560), n, WHITE, 3.5f, 1); }
+            vec::text(cv, e.cx, e.cy + 28, fit(m.zip.msg, 4, 560), m.zip.msg, m.zip.ok ? VIOLET : RED, 2.5f, 1);
+            if (m.zip.ok) vec::text(cv, e.cx, e.cy + 66, 3.4f, "NOT SUPPORTED YET", DIM, 2.2f, 1);
             // small clear button
             Ellipse c = shape_of(F_CLEAR);
             cv.bubble(c.cx, c.cy, c.rx, c.ry, m.hover == F_CLEAR ? WHITE : DIM, 3.0f);
@@ -259,7 +281,7 @@ inline void draw(vec::Canvas& cv, const Model& m, int frame = 0) {
     }
     // ---- 3: upscale ----
     {
-        vec::text(cv, 960, 585, 5, "3  UPSCALE", DIM, 3.0f, 1);
+        vec::text(cv, 960, 505, 5, "3  UPSCALE", DIM, 3.0f, 1);
         static const char* names[4] = {"1X", "2X", "3X", "4X"};
         for (int i = 0; i < 4; ++i) {
             const int f = F_UP1 + i; Ellipse e = shape_of(f);
@@ -269,10 +291,28 @@ inline void draw(vec::Canvas& cv, const Model& m, int frame = 0) {
             vec::text(cv, e.cx, e.cy - 25, 8.5f, names[i], sel ? GREEN : (m.hover == f ? WHITE : DIM), 5.0f, 1);
         }
         static const char* caps[4] = {"ORIGINAL", "", "", "~1080P"};
-        for (int i = 0; i < 4; ++i) if (caps[i][0]) vec::text(cv, shape_of(F_UP1 + i).cx, 738, 3.4f, caps[i], DIM, 2.2f, 1);
+        for (int i = 0; i < 4; ++i) if (caps[i][0]) vec::text(cv, shape_of(F_UP1 + i).cx, 650, 3.4f, caps[i], DIM, 2.2f, 1);
         const int n = m.s.upscale;
         std::string info = n == 1 ? "ORIGINAL PS1 PIXELS (512 X 256)" : "LINES DRAWN AT " + std::to_string(512 * n) + " X " + std::to_string(256 * n) + " AND SMOOTHED";
-        vec::text(cv, 960, 765, 4, info, WHITE, 2.5f, 1);
+        vec::text(cv, 960, 686, 4, info, WHITE, 2.5f, 1);
+    }
+    // ---- 4: options (check boxes) ----
+    {
+        vec::text(cv, 960, 718, 5, "4  OPTIONS", DIM, 3.0f, 1);
+        struct Opt { int f; const char* name; const char* hint; bool on; };
+        const Opt opts[3] = {{F_OPT_GLOW, "NEON GLOW", "SOFT GLOW AROUND THE LINES (F9)", m.s.glow},
+                             {F_OPT_FF, "FAST-FORWARD", "HOLD TAB OR PRESS R-STICK", m.s.ffwd},
+                             {F_OPT_SHOT, "SCREENSHOTS", "F12 SAVES A .BMP PICTURE", m.s.shot}};
+        for (const Opt& o : opts) {
+            Ellipse e = shape_of(o.f);
+            bubble(o.f, o.on ? GREEN : DIM, o.on ? 4.0f : 3.0f);
+            const float bx = e.cx - e.rx + 70, by = e.cy, hs = 22;   // the check box
+            cv.polyline({{bx - hs, by - hs}, {bx + hs, by - hs}, {bx + hs, by + hs}, {bx - hs, by + hs}}, o.on ? GREEN : (m.hover == o.f ? WHITE : DIM), 3.5f, true);
+            if (o.on) cv.polyline({{bx - 12, by + 1}, {bx - 3, by + 12}, {bx + 14, by - 13}}, GREEN, 5.5f);
+            const float tx = e.cx + 42;
+            vec::text(cv, tx, e.cy - 28, fit(o.name, 4.6f, 330), o.name, o.on ? GREEN : (m.hover == o.f ? WHITE : DIM), 3.0f, 1);
+            vec::text(cv, tx, e.cy + 8, fit(o.hint, 2.8f, 330), o.hint, DIM, 2.0f, 1);
+        }
     }
     // ---- start ----
     {
@@ -280,11 +320,11 @@ inline void draw(vec::Canvas& cv, const Model& m, int frame = 0) {
         const bool ok = m.can_start();
         bubble(F_START, ok ? GREEN : DIM, ok ? 5.0f : 3.0f);
         if (ok) cv.bubble(e.cx, e.cy, e.rx - 14, e.ry - 11, GREEN, 3.0f, 0.8f);
-        vec::text(cv, e.cx, e.cy - (ok ? 36 : 56), 12, "START", ok ? GREEN : DIM, 7.0f, 1);
-        if (!ok) vec::text(cv, e.cx, e.cy + 24, 3.6f, "DROP YOUR DISC FIRST", DIM, 2.4f, 1);
+        vec::text(cv, e.cx, e.cy - (ok ? 34 : 48), ok ? 9 : 8.5f, "START", ok ? GREEN : DIM, 5.5f, 1);
+        if (!ok) vec::text(cv, e.cx, e.cy + 18, 3.4f, "DROP YOUR DISC FIRST", DIM, 2.4f, 1);
     }
     // ---- toast + footer ----
-    if (!m.toast.empty()) vec::text(cv, 960, 995, fit(m.toast, 4.4f, 1500), m.toast, VIOLET, 2.8f, 1);
+    if (!m.toast.empty()) vec::text(cv, 960, 1008, fit(m.toast, 4.0f, 1500), m.toast, VIOLET, 2.6f, 1);
     vec::text(cv, 60, 1048, 3.2f, m.bios_ok ? "BIOS: " + upper(m.bios_name) : "BIOS MISSING - DROP BIOS.BIN HERE", m.bios_ok ? GREEN : RED, 2.2f, 0);
     vec::text(cv, 1860, 1048, 3.2f, "ARROWS + ENTER   F11 FULLSCREEN   ESC QUIT", DIM, 2.2f, 2);
     (void)frame;

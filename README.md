@@ -53,6 +53,29 @@ Keyboard: arrows or WASD = D-pad, Z/Space = Cross, X = Circle, C = Square, V = T
 | Windows build (`src/main.cpp`, CMake, CI) | Written and type-checked, **never compiled with real SDL** -- first CI run may need a small fix |
 | Gouraud/dither/exact fill rules, semi-transparency edge cases | Approximate |
 
+## In-game extras (new in wip10/wip11)
+
+- **Screenshots (F12)**: saves the current game picture as a `.bmp` in a `screenshots` folder next to the exe
+  (`vibribbon-YYYYMMDD-HHMMSS.bmp`). It uses the upscale you picked, so at 4x you get a 2048 x 1024 picture of the smooth lines.
+- **Fast-forward (hold Tab, or press the controller's right stick)**: runs the game 4x faster while held, sound muted,
+  and drops back to normal speed (and sound) the moment you let go. Handy for skipping the ~8 s music lookahead and loading screens.
+
+- **Neon glow (F9)**: toggles a soft bloom around the bright lines (`src/glow.h`), so the black-and-white ribbon looks like a glowing
+  neon sign. Off by default, applies to screenshots too. Cheap at 1x-2x; at 4x it adds a few ms per frame.
+
+All three are **check boxes in the launcher** ("4 OPTIONS", saved in `vibribbon-settings.ini`): *Neon glow* sets whether the glow starts
+on (F9 still flips it during a game), while *Fast-forward* and *Screenshots* switch Tab / F12 on or off. Defaults: glow off,
+fast-forward on, screenshots on. Click a box, or move onto it with the arrows / D-pad and press Enter / A.
+
+The window title lists these keys and shows `FAST-FORWARD` while it is active.
+
+## Building
+
+CI (`.github/workflows/build.yml`) builds `vibribbon.exe` with Visual Studio 2022, runs the unit tests (`ctest`), uploads the
+`vibribbon-windows` artifact and, for tags like `v0.2`, attaches `vibribbon-windows.zip` to a GitHub Release.
+Locally: `cmake -S . -B build -A x64 && cmake --build build --config Release`. The headless developer tools in `tests/` that
+need your disc are off by default; add `-DVIBRIBBON_DEV_TOOLS=ON` to build them.
+
 ## Layout
 
 - `src/cpu.h` - R3000 interpreter, memory map, real-BIOS boot (`load_bios`/`sideload_exe`) and a fallback high-level BIOS

@@ -25,33 +25,37 @@ target_link_libraries(vibribbon PRIVATE SDL2::SDL2main SDL2::SDL2-static)
 
 # Unit tests (run in CI; need no game files)
 enable_testing()
-add_executable(pad_map_test tests/pad_map_test.cpp)
+foreach(t pad_map_test cpu_test runlog_test gpu_hires_test launcher_test glow_test)
+  add_executable(${t} tests/${t}.cpp)
+  target_include_directories(${t} PRIVATE src)
+  if(MSVC)
+    target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    target_compile_options(${t} PRIVATE /EHsc /utf-8)
+  endif()
+endforeach()
 add_test(NAME pad_map COMMAND pad_map_test)
-add_executable(cpu_test tests/cpu_test.cpp)
 add_test(NAME cpu COMMAND cpu_test)
+add_test(NAME runlog COMMAND runlog_test)
+add_test(NAME gpu_hires COMMAND gpu_hires_test)
+add_test(NAME glow COMMAND glow_test)
+add_test(NAME launcher COMMAND launcher_test WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
-# Headless developer tools (need your disc): disc_info, boot_trace, title_shot
-add_executable(disc_info tests/disc_info.cpp)
-add_executable(boot_trace tests/boot_trace.cpp)
-add_executable(title_shot tests/title_shot.cpp)
-add_executable(audio_test tests/audio_test.cpp)
-add_executable(bios_boot tests/bios_boot.cpp)
-add_executable(bios_title tests/bios_title.cpp)
-add_executable(menu_nav tests/menu_nav.cpp)
-add_executable(game_try tests/game_try.cpp)
-add_executable(game_try2 tests/game_try2.cpp)
-add_executable(gpu_capture tests/gpu_capture.cpp)   # menu_nav bios.bin game.cue prefix -- taps buttons, saves screenshots
-add_executable(howto_e2e tests/howto_e2e.cpp)   # howto_e2e bios.bin game.cue prefix -- boots and taps through to the HOW TO PLAY tutorial (exit 0 = reached it)
-add_executable(script_run tests/script_run.cpp)   # script_run bios.bin game.cue prefix "w1500 X w400 X p" -- drive menus with a tiny script, screenshots + state
-add_executable(runlog_test tests/runlog_test.cpp)   # unit test for the run log
-add_executable(cdvol_watch tests/cdvol_watch.cpp)   # cdvol_watch bios cue "w1500 X w400 X ..." -- logs SPU CD volume / CD play+mute changes
-add_executable(spu_reverb_test tests/spu_reverb_test.cpp)   # reverb unit as a PCM player (how the game plays its music)
-add_executable(music_timeline tests/music_timeline.cpp)    # music_timeline bios cue [out.wav] -- Bronze level output level over time, with a pause
-add_executable(gpu_hires_test tests/gpu_hires_test.cpp)   # upscaled (2x-4x) smooth-line mode of the GPU
-add_executable(launcher_test tests/launcher_test.cpp)     # launcher_test [game.cue] [out_prefix] -- launcher logic + renders screenshots
-add_executable(hires_shots tests/hires_shots.cpp)         # hires_shots bios cue scale out_prefix -- game screens + per-frame cost at 1x-4x
-add_executable(cmd_census tests/cmd_census.cpp)           # which GPU commands the game uses on each screen
-add_executable(gpu_hires_test tests/gpu_hires_test.cpp)   # upscaled (2x-4x) line mode of the GPU
-add_executable(launcher_test tests/launcher_test.cpp)     # launcher_test [game.cue] [out_prefix] -- model tests + screenshots
-add_executable(hires_shots tests/hires_shots.cpp)         # hires_shots bios cue scale out_prefix -- screenshots + timing
-add_executable(cmd_census tests/cmd_census.cpp)           # which GP0 commands the game uses
+if(MSVC)
+  target_compile_definitions(vibribbon PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+  target_compile_options(vibribbon PRIVATE /EHsc /utf-8)
+endif()
+
+# Headless developer tools (need your disc/BIOS). Off by default so a normal build and CI stay fast:
+#   cmake -S . -B build -DVIBRIBBON_DEV_TOOLS=ON
+option(VIBRIBBON_DEV_TOOLS "Build the headless developer tools in tests/" OFF)
+if(VIBRIBBON_DEV_TOOLS)
+  foreach(t disc_info boot_trace title_shot audio_test bios_boot bios_title menu_nav game_try game_try2 gpu_capture
+            howto_e2e script_run cdvol_watch spu_reverb_test music_timeline hires_shots cmd_census)
+    add_executable(${t} tests/${t}.cpp)
+    target_include_directories(${t} PRIVATE src)
+    if(MSVC)
+      target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+      target_compile_options(${t} PRIVATE /EHsc /utf-8)
+    endif()
+  endforeach()
+endif()

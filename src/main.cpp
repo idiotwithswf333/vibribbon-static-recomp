@@ -359,7 +359,7 @@ int main(int argc, char** argv) {
     auto start_cd_trace = [&]() {   // log what the game asks the drive for after a disc swap (sent in vibribbon-log.txt)
         if (!emu.cpu) return;
         emu.cpu->cd.on_trace = [](const std::string& m) { g_log.note("CD: %s", m.c_str()); };
-        emu.cpu->cd.trace_left = 800;
+        emu.cpu->cd.trace_left = 1500;
     };
     auto insert_own_cd = [&]() {
         if (!emu.cpu) return;

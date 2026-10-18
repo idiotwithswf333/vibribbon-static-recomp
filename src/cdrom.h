@@ -38,6 +38,14 @@ public:
     void request_swap(std::shared_ptr<const vcd::Disc> d) { swap_to_ = std::move(d); swap_pending_ = true; swap_phase_ = 0; }
     // Diagnostics: while trace_left > 0 every command the game sends and every answer it gets is passed to on_trace.
     std::function<void(const std::string&)> on_trace; int trace_left = 0;
+    void trace_line(const std::string& m) {   // a command/answer pair identical to the previous pair is only counted
+        const bool is_cmd = m.compare(0, 3, "cmd") == 0;
+        std::string& last = is_cmd ? last_cmd_ : last_ans_;
+        if (m == last && (is_cmd || skip_ans_)) { skip_ans_ = is_cmd; if (is_cmd) ++trace_rep_; return; }
+        if (is_cmd && trace_rep_) { on_trace("   (that command and its answer repeated " + std::to_string(trace_rep_) + " more times)"); trace_rep_ = 0; }
+        if (!is_cmd) skip_ans_ = false; else skip_ans_ = false;
+        last = m; --trace_left; on_trace(m);
+    }
     bool lid_open() const { return lid_open_; }
     bool swap_busy() const { return swap_pending_; }
     bool own_cd() const { return vcd != nullptr; }
@@ -124,9 +132,9 @@ public:
             schedule_sector(now);
         }
         if (on_trace && trace_left > 0) {
-            --trace_left; char b[120]; int n = std::snprintf(b, sizeof b, "answer INT%d:", e.irq);
+            char b[120]; int n = std::snprintf(b, sizeof b, "answer INT%d:", e.irq);
             for (size_t i = 0; i < e.resp.size() && i < 8 && n < 100; ++i) n += std::snprintf(b + n, sizeof b - n, " %02X", e.resp[i]);
-            on_trace(b);
+            trace_line(b);
         }
         resp.assign(e.resp.begin(), e.resp.end());
         ifr = (uint8_t)e.irq;
@@ -146,6 +154,7 @@ private:
 
     static constexpr uint64_t kFirst = 15000, kSecond = 30000, kSector = 90000;   // ~375 sectors/s: faster than a real 2x drive (150/s) but slower than the real kernel IRQ path
 
+    std::string last_cmd_, last_ans_; int trace_rep_ = 0; bool skip_ans_ = false;
     std::shared_ptr<const vcd::Disc> swap_to_; bool swap_pending_ = false, lid_open_ = false, shell_flag_ = false; int swap_phase_ = 0; uint64_t swap_t_ = 0;
     static constexpr uint64_t kLidOpenCycles = 40000000;   // ~1.2 s of emulated time with the lid open
     // Status byte: bit1 motor on, bit7 playing, bit4 ShellOpen (lid open now, or opened since the last Getstat).
@@ -183,13 +192,20 @@ private:
         if (dbg_log.size() < 40) { char b[96]; std::snprintf(b, sizeof b, "cmd %02X params=%zu p0=%02X p1=%02X p2=%02X", c, params.size(), params.size()>0?params[0]:0, params.size()>1?params[1]:0, params.size()>2?params[2]:0); dbg_log.push_back(b); }
         std::vector<uint8_t> p(params.begin(), params.end());
         if (on_trace && trace_left > 0) {
-            --trace_left; char b[120]; int n = std::snprintf(b, sizeof b, "cmd %02X (lid %s, %s):", c, lid_open_ ? "open" : "closed", vcd ? "own CD" : "game disc");
+            char b[120]; int n = std::snprintf(b, sizeof b, "cmd %02X (lid %s, %s):", c, lid_open_ ? "open" : "closed", vcd ? "own CD" : "game disc");
             for (size_t i = 0; i < p.size() && i < 6; ++i) n += std::snprintf(b + n, sizeof b - n, " %02X", p[i]);
-            on_trace(b);
+            trace_line(b);
         }
         params.clear(); resp.clear();
         uint64_t t = now_ + kFirst;
         busy_until = t;
+        if (lid_open_) {   // door open: like a real drive, anything that needs a disc fails (INT5, error bit + ShellOpen, "not ready")
+            switch (c) {
+            case 0x03: case 0x06: case 0x1B: case 0x11: case 0x13: case 0x14: case 0x15: case 0x16: case 0x1E:
+                push(t, 5, {(uint8_t)(stat() | 1), 0x80}); return;
+            default: break;
+            }
+        }
         switch (c) {
         case 0x01: push(t, 3, {stat()}); if (!lid_open_) shell_flag_ = false; break;   // Getstat (reading it after the lid closed clears ShellOpen)
         case 0x02: if (p.size() >= 3) {                                          // Setloc

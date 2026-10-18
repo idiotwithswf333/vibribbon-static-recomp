@@ -54,6 +54,7 @@ int main() {
     d.cd.request_swap(disc);
     d.run(1000);
     CHECK(d.cd.lid_open() && (d.stat() & 0x10) && !(d.stat() & 0x02));
+    { auto r = d.cmd(0x11); CHECK(r.first == 5 && r.second.size() == 2 && r.second[0] == 0x11 && r.second[1] == 0x80); }   // GetlocP with the door open = error
     d.run(30000000); CHECK(d.cd.lid_open());                                   // still open after ~0.9 s
     d.run(15000000);                                                           // closed after ~1.2 s
     CHECK(!d.cd.lid_open() && d.cd.own_cd() && !d.cd.swap_busy());

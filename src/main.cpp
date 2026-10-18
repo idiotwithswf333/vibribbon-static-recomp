@@ -482,6 +482,11 @@ int main(int argc, char** argv) {
                 if (mode == Mode::Game) go_launcher(""); else if (lm.page_mods) { lm.close_mods(); ldirty = true; } else { running = false; g_log.note("Esc pressed: closing"); }
             }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F8 && mode == Mode::Game && emu.cpu) { if (own_cd_in) restore_game_cd(); else insert_own_cd(); }
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F7 && mode == Mode::Game && emu.cpu) {   // own CD experiment: how the drive answers data reads of an audio disc
+                int& m = emu.cpu->cd.audio_read_mode; m = (m + 1) % 3;
+                static const char* names[3] = {"0: audio bytes handed over as data", "1: audio sectors skipped silently", "2: data read of audio disc = error"};
+                note_title(std::string("Own CD read mode ") + names[m] + " (F7 changes it, then press F8)", 5000);
+            }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F9) {   // neon glow on/off
                 neon = !neon;
                 SDL_SetWindowTitle(win, neon ? "Neon glow ON (F9)" : "Neon glow OFF (F9)"); warn_until = SDL_GetTicks() + 2000;
@@ -590,7 +595,7 @@ int main(int argc, char** argv) {
         uint32_t now = SDL_GetTicks();
         if (emu.cpu && now - last_title >= 1000 && now > warn_until) {   // FPS in the title bar
             char t[160];
-            std::snprintf(t, sizeof t, "UC Vib-Ribbon - %u fps%s | %ux | Esc launcher | F8 own CD | F9 glow | F12 screenshot | hold Tab fast-forward | F10 tap filter: %s", frames, ff_now ? " FAST-FORWARD" : "", emu.cpu->gpu.scale(), g_tap.enabled ? "ON" : "OFF");
+            std::snprintf(t, sizeof t, "UC Vib-Ribbon - %u fps%s | %ux | Esc launcher | F7 CD mode | F8 own CD | F9 glow | F12 screenshot | hold Tab fast-forward | F10 tap filter: %s", frames, ff_now ? " FAST-FORWARD" : "", emu.cpu->gpu.scale(), g_tap.enabled ? "ON" : "OFF");
             SDL_SetWindowTitle(win, t);
             frames = 0; last_title = now;
         }
@@ -607,6 +612,7 @@ int main(int argc, char** argv) {
             if (fps < (c.gpu.pal() ? 45.0 : 54.0) && hb_frames > 0) g_log.note("WARNING: running slow (%.1f fps). The game will play too slowly.", fps);
             if (c.vblanks == last_vblanks) g_log.note("WARNING: the game did not advance a single frame in %.0f s", secs);
             last_vblanks = c.vblanks;
+            if (c.cd.own_cd()) g_log.note("CD commands since the swap (code:count): %s| read mode %d", c.cd.cmd_summary().c_str(), c.cd.audio_read_mode);
             uint64_t h = hash_pixels(pixels);
             if (h == last_hash) {
                 ++same_hash;

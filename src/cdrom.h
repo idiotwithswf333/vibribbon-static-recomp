@@ -9,6 +9,7 @@
 #include <functional>
 #include <vector>
 #include <memory>
+#include <map>
 #include "disc.h"
 #include "vcd.h"
 
@@ -35,7 +36,7 @@ public:
     // the original game disc again). While `vcd` is set the drive is an audio-only disc: GetTN / GetTD / GetlocP /
     // Play use its tracks and GetID answers "audio CD", exactly what a real drive reports for a music CD.
     std::shared_ptr<const vcd::Disc> vcd;
-    void request_swap(std::shared_ptr<const vcd::Disc> d) { swap_to_ = std::move(d); swap_pending_ = true; swap_phase_ = 0; }
+    void request_swap(std::shared_ptr<const vcd::Disc> d) { swap_to_ = std::move(d); swap_pending_ = true; swap_phase_ = 0; cmd_counts.clear(); }
     // Diagnostics: while trace_left > 0 every command the game sends and every answer it gets is passed to on_trace.
     std::function<void(const std::string&)> on_trace; int trace_left = 0;
     void trace_line(const std::string& m) {   // commands: skipped if the same as one of the last two; answers: skipped for those, and INT1 (sector ready)
@@ -47,6 +48,11 @@ public:
         } else if (skip_ans_ || m.compare(0, 11, "answer INT1") == 0) return;
         --trace_left; on_trace(m);
     }
+    // What the drive does when the game READS (ReadN/ReadS) sectors of an audio-only disc (the own CD): 0 = hands the audio bytes over as
+    // data (as a data disc would), 1 = skips them silently (no INT1, no data), 2 = answers the read command with an error (INT5).
+    int audio_read_mode = 0;
+    std::map<int, int> cmd_counts;   // commands the game sent since the last swap (code -> count), for the log
+    std::string cmd_summary() const { std::string r; char b[24]; for (auto& kv : cmd_counts) { std::snprintf(b, sizeof b, "%02X:%d ", kv.first, kv.second); r += b; } return r; }
     bool lid_open() const { return lid_open_; }
     bool swap_busy() const { return swap_pending_; }
     bool own_cd() const { return vcd != nullptr; }
@@ -131,6 +137,8 @@ public:
             if (vcd && loc >= vcd->sectors) {   // read past the end of the music CD: the drive stops at the lead-out (INT4 "data end")
                 reading = false; e.resp = {0x02}; e.irq = 4;
                 if (on_trace && trace_left > 0) { --trace_left; on_trace("reading reached the lead-out (end of the own CD)"); }
+            } else if (vcd && audio_read_mode == 1) {   // audio sector read as data: the drive just moves on, nothing is delivered
+                ++loc; schedule_sector(now); return false;
             } else {
                 load_sector();
                 e.resp = {stat_reading()}; e.irq = 1;
@@ -195,6 +203,7 @@ private:
     }
     void command(uint8_t c) {
         ++cmds;
+        ++cmd_counts[c];
         if (cmd_hist.size() < 100000) { char b[80]; std::snprintf(b, sizeof b, "%llu cmd %02X np=%zu p=%02X %02X %02X", (unsigned long long)now_, c, params.size(), params.size()>0?params[0]:0, params.size()>1?params[1]:0, params.size()>2?params[2]:0); cmd_hist.push_back(b); }
         if (dbg_log.size() < 40) { char b[96]; std::snprintf(b, sizeof b, "cmd %02X params=%zu p0=%02X p1=%02X p2=%02X", c, params.size(), params.size()>0?params[0]:0, params.size()>1?params[1]:0, params.size()>2?params[2]:0); dbg_log.push_back(b); }
         std::vector<uint8_t> p(params.begin(), params.end());
@@ -209,6 +218,7 @@ private:
         if (lid_open_) {   // door open: like a real drive, anything that needs a disc fails (INT5, error bit + ShellOpen, "not ready")
             switch (c) {
             case 0x03: case 0x06: case 0x1B: case 0x11: case 0x13: case 0x14: case 0x15: case 0x16: case 0x1E:
+            if (vcd && audio_read_mode == 2) { push(t, 5, {(uint8_t)(stat() | 1), 0x80}); break; }   // an audio disc cannot be read as data
                 push(t, 5, {(uint8_t)(stat() | 1), 0x80}); return;
             default: break;
             }

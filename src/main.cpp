@@ -25,6 +25,7 @@
 #include <initializer_list>
 #include "pad_map.h"
 #include "launcher.h"
+#include "mp3_audio.h"
 #include "runlog.h"
 
 namespace {
@@ -193,8 +194,8 @@ std::string boot_disc(const std::string& cue, Emulator& emu) {
     disc::PsxExe exe;
     if (boot.empty() || !img->read_file(boot, f) || !disc::parse_psx_exe(f, exe))
         return "Error: no bootable PS1 executable on disc";
-    if (boot != "SCES_028.73")
-        return "This is " + boot + ", not the Vib-Ribbon EU disc (SCES_028.73); not supported";
+    if (boot != "SCES_028.73" && boot != "SCPS_180.12")   // EU (PAL) and JP (NTSC) discs
+        return "This is " + boot + ", not a Vib-Ribbon disc (EU SCES_028.73 or JP SCPS_180.12); not supported";
     if (g_bios.empty()) g_bios = find_bios(cue);
 
     auto cpu = std::make_unique<cpu::Cpu>();
@@ -238,7 +239,7 @@ int main(int argc, char** argv) {
         g_log.note("Log file: %s", g_log.path().c_str());
         for (int i = 1; i < argc; ++i) g_log.note("Command line argument %d: %s", i, argv[i]);
     }
-    SDL_Window* win = SDL_CreateWindow("Vib-Ribbon launcher", SDL_WINDOWPOS_CENTERED,
+    SDL_Window* win = SDL_CreateWindow("UC Vib-Ribbon launcher", SDL_WINDOWPOS_CENTERED,
                                        SDL_WINDOWPOS_CENTERED, 960, 720, SDL_WINDOW_RESIZABLE);
     SDL_Renderer* ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED) : nullptr;
     if (!win || !ren) {
@@ -248,7 +249,7 @@ int main(int argc, char** argv) {
     }
     { SDL_RendererInfo ri; if (SDL_GetRendererInfo(ren, &ri) == 0) g_log.note("Renderer: %s", ri.name); }
     SDL_RenderSetLogicalSize(ren, 640, 480);   // always shown 4:3, like a TV
-    SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
+    SDL_EventState(SDL_DROPFILE, SDL_ENABLE); SDL_EventState(SDL_DROPBEGIN, SDL_ENABLE); SDL_EventState(SDL_DROPCOMPLETE, SDL_ENABLE);
     open_first_controller();
     g_log.note("Controller: %s", g_pad ? SDL_GameControllerName(g_pad) : "none connected (keyboard only)");
 
@@ -258,8 +259,9 @@ int main(int argc, char** argv) {
     SDL_AudioDeviceID audio = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
     if (audio) { SDL_PauseAudioDevice(audio, 0); g_log.note("Audio: opened %d Hz, %d channels, driver %s", have.freq, (int)have.channels, SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?"); }
     else { std::fprintf(stderr, "Audio unavailable: %s\n", SDL_GetError()); g_log.note("WARNING: no audio device (%s). The game still runs; sound is silent.", SDL_GetError()); }
-    constexpr int kAudioFrames = 44100 / 50;
-    std::vector<int16_t> audio_buf((size_t)kAudioFrames * 2);
+    constexpr int kMaxAudioFrames = 44100 / 50;   // PAL frame = 882 samples (NTSC = 735)
+    std::vector<int16_t> audio_buf((size_t)kMaxAudioFrames * 2);
+    double pace_carry = 0.0;   // fractional ms carried between frames so 16.67 ms NTSC frames average out
 
     Emulator emu;
     SDL_Texture* tex = nullptr;
@@ -279,10 +281,10 @@ int main(int argc, char** argv) {
     auto update_summary = [&](const char* how) {
         char b[900]; double run = g_log.elapsed();
         std::snprintf(b, sizeof b,
-            "Run time: %.1f s (%s)\nFrames shown: %u (average %.1f fps, target 50)\nHeartbeat fps: min %.1f, max %.1f\n"
+            "Run time: %.1f s (%s)\nFrames shown: %u (average %.1f fps, target %.0f)\nHeartbeat fps: min %.1f, max %.1f\n"
             "Slow frames (over 40 ms): %u, worst frame: %u ms\nButton changes: %u\nScreen-unchanged warnings: %u\n"
             "Disc: %s\nBIOS: %s\nCPU stopped: %s\nLast CPU position: %s\nD-pad tap filter: %s",
-            run, how, total_frames, run > 0 ? total_frames / run : 0.0, hb_count ? fps_min : 0.0, fps_max, slow_frames, max_frame_ms,
+            run, how, total_frames, run > 0 ? total_frames / run : 0.0, (emu.cpu && !emu.cpu->gpu.pal()) ? 60.0 : 50.0, hb_count ? fps_min : 0.0, fps_max, slow_frames, max_frame_ms,
             pad_changes, stall_warnings, last_disc.c_str(), g_bios.empty() ? "none (controller will not work)" : g_bios.c_str(),
             last_halt.c_str(),
             emu.cpu ? ([&] { char t[16]; std::snprintf(t, sizeof t, "%08X", emu.cpu->pc); return std::string(t); })().c_str() : "n/a",
@@ -302,6 +304,10 @@ int main(int argc, char** argv) {
     vec::Canvas lcv;
     SDL_Texture* ltex = nullptr;
     bool ldirty = true;
+    int last_lframe = -1;
+    std::shared_ptr<const vcd::Disc> own_cd;   // the MP3s decoded into a virtual audio CD (built on first use)
+    bool own_cd_dirty = true, own_cd_in = false;   // playlist changed since it was built / the own CD is in the drive
+    bool mp3_fresh = false, mp3_dirty = false;      // drop-batch bookkeeping
     if (argc > 1) saved.cue = argv[1];   // a disc given on the command line starts straight away
     if (g_bios.empty()) g_bios = find_bios(saved.cue);
     lm.init(saved, !g_bios.empty(), launcher::file_name(g_bios));
@@ -313,9 +319,10 @@ int main(int argc, char** argv) {
         mode = m;
         SDL_RenderSetLogicalSize(ren, m == Mode::Launcher ? launcher::kW : 640, m == Mode::Launcher ? launcher::kH : 480);
         if (!fullscreen) SDL_SetWindowSize(win, m == Mode::Launcher ? 1280 : 960, 720);
-        if (m == Mode::Launcher) { ldirty = true; SDL_SetWindowTitle(win, "Vib-Ribbon launcher"); }
+        if (m == Mode::Launcher) { ldirty = true; SDL_SetWindowTitle(win, "UC Vib-Ribbon launcher"); }
     };
     auto go_launcher = [&](const std::string& toast) {
+        own_cd_in = false;
         emu.cpu.reset(); emu.img.reset();
         if (audio) SDL_ClearQueuedAudio(audio);
         set_mode(Mode::Launcher);
@@ -326,7 +333,7 @@ int main(int argc, char** argv) {
     std::string last_cue;
     uint32_t warn_until = 0;
     auto start = [&](const std::string& cue) {
-        last_cue = cue; last_disc = cue;
+        last_cue = cue; last_disc = cue; own_cd_in = false;
         g_log.note("Loading disc: %s (upscale %dx)", cue.c_str(), lm.s.upscale);
         std::string msg = boot_disc(cue, emu);
         if (emu.cpu) emu.cpu->gpu.set_scale(lm.s.upscale);
@@ -335,7 +342,7 @@ int main(int argc, char** argv) {
         g_log.note("BIOS in use: %s", g_bios.empty() ? "none found" : g_bios.c_str());
         g_log.note("Boot result: %s", msg.empty() ? "started OK" : msg.c_str());
         last_halt = "no"; hb_last = SDL_GetTicks(); hb_frames = 0; same_hash = 0; last_hash = 0; last_vblanks = 0;
-        if (msg.empty()) SDL_SetWindowTitle(win, "Vib-Ribbon");
+        if (msg.empty()) SDL_SetWindowTitle(win, "UC Vib-Ribbon");
         else {
             bool warn = msg[0] == '!';
             if (warn) msg = msg.substr(1);
@@ -346,6 +353,32 @@ int main(int argc, char** argv) {
         }
         set_mode(Mode::Game);
     };
+    // ---- Feature: own CD. Drop .mp3 files on the window (any time); F8 (or dropping while playing) swaps the drive's disc for
+    // a virtual audio CD made from them, the way you would open the lid and put your own CD in. F8 again puts the game disc back.
+    auto note_title = [&](const std::string& m, uint32_t ms) { SDL_SetWindowTitle(win, m.c_str()); warn_until = SDL_GetTicks() + ms; g_log.note("%s", m.c_str()); };
+    auto insert_own_cd = [&]() {
+        if (!emu.cpu) return;
+        if (lm.s.mp3.empty()) { note_title("No MP3s yet: drop .mp3 files on this window, then press F8", 5000); return; }
+        if (own_cd_dirty || !own_cd) {
+            note_title("Reading your MP3s...", 60000); SDL_PumpEvents();
+            auto d = std::make_shared<vcd::Disc>(); std::string last_err;
+            for (const std::string& p : lm.s.mp3) {
+                std::vector<int16_t> pcm; std::string err;
+                if (mp3audio::load(p, pcm, err) && d->add_track(pcm, p)) g_log.note("MP3 track %zu: %s (%.0f s)", d->tracks(), p.c_str(), pcm.size() / 2 / 44100.0);
+                else { last_err = err; g_log.note("MP3 skipped (%s): %s", err.c_str(), p.c_str()); }
+            }
+            if (d->tracks() == 0) { note_title("Could not read any MP3 (" + last_err + ")", 6000); return; }
+            own_cd = d; own_cd_dirty = false;
+        }
+        emu.cpu->cd.request_swap(own_cd); own_cd_in = true;
+        note_title("CD lid open - your MP3 CD (" + std::to_string(own_cd->tracks()) + (own_cd->tracks() == 1 ? " track" : " tracks") + ") goes in. F8 puts the game disc back", 6000);
+    };
+    auto restore_game_cd = [&]() {
+        if (!emu.cpu) return;
+        emu.cpu->cd.request_swap(nullptr); own_cd_in = false;
+        note_title("CD lid open - game disc goes back in", 4000);
+    };
+
     set_mode(Mode::Launcher);
     if (argc > 1) start(saved.cue);
 
@@ -371,6 +404,21 @@ int main(int argc, char** argv) {
         }
         for (SDL_Event e; SDL_PollEvent(&e);) {
             if (e.type == SDL_QUIT) { running = false; g_log.note("Window closed by the user"); }
+            if (e.type == SDL_DROPBEGIN) mp3_fresh = true;   // a new batch of dropped files: its MP3s replace the old playlist
+            if (e.type == SDL_DROPCOMPLETE && mp3_dirty) {
+                mp3_dirty = false; launcher::save_settings(settings_path, lm.s); ldirty = true;
+                if (mode == Mode::Game && emu.cpu) insert_own_cd();   // dropped while playing = "here is my CD"
+                else lm.say(std::to_string(lm.s.mp3.size()) + " MP3 READY - START THE GAME, THEN PRESS F8 WHEN IT ASKS FOR A CD", 500);
+            }
+            if (e.type == SDL_DROPFILE && e.drop.file) {   // MP3s are handled on the raw UTF-8 name (the path class would mangle non-ASCII names on Windows)
+                const std::string raw = e.drop.file; const std::string low = launcher::lower(raw);
+                if (low.size() > 4 && low.compare(low.size() - 4, 4, ".mp3") == 0) {
+                    g_log.note("MP3 dropped on the window: %s", raw.c_str());
+                    if (mp3_fresh) { lm.s.mp3.clear(); mp3_fresh = false; }
+                    lm.add_mp3(raw); mp3_dirty = true; own_cd_dirty = true; ldirty = true;
+                    SDL_free(e.drop.file); continue;
+                }
+            }
             if (e.type == SDL_DROPFILE) {
                 std::filesystem::path dropped = e.drop.file;
                 g_log.note("File dropped on the window: %s", e.drop.file);
@@ -427,6 +475,7 @@ int main(int argc, char** argv) {
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) {   // Esc: game -> launcher, launcher -> quit
                 if (mode == Mode::Game) go_launcher(""); else if (lm.page_mods) { lm.close_mods(); ldirty = true; } else { running = false; g_log.note("Esc pressed: closing"); }
             }
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F8 && mode == Mode::Game && emu.cpu) { if (own_cd_in) restore_game_cd(); else insert_own_cd(); }
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F9) {   // neon glow on/off
                 neon = !neon;
                 SDL_SetWindowTitle(win, neon ? "Neon glow ON (F9)" : "Neon glow OFF (F9)"); warn_until = SDL_GetTicks() + 2000;
@@ -472,8 +521,10 @@ int main(int argc, char** argv) {
             const bool had_toast = !lm.toast.empty(); lm.tick();
             if (had_toast && lm.toast.empty()) ldirty = true;
             if (mode == Mode::Launcher) {   // (start() may have switched to the game)
+                const int lframe = launcher::logo_frame_at(SDL_GetTicks());
+                if (lframe != last_lframe) { last_lframe = lframe; ldirty = true; }   // the logo animates, so redraw on each new frame
                 if (ldirty) {
-                    launcher::draw(lcv, lm);
+                    launcher::draw(lcv, lm, lframe);
                     if (!ltex) { SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear"); ltex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, launcher::kW, launcher::kH); }
                     SDL_UpdateTexture(ltex, nullptr, lcv.px.data(), launcher::kW * 4);
                     ldirty = false;
@@ -505,11 +556,12 @@ int main(int argc, char** argv) {
                 // The SPU voice envelopes and the CD-audio read position only advance inside audio_frame(), and
                 // the game WAITS on both (e.g. "has the sound effect finished?", "has the CD reached the track?").
                 // So this must run once per video frame even when there is no sound device or the queue is full.
-                emu.cpu->audio_frame(kAudioFrames, audio_buf.data());
+                const int nsamp = emu.cpu->frame_samples();
+                emu.cpu->audio_frame(nsamp, audio_buf.data());
                 // Keep the queue shallow (~100 ms) so sound stays in sync with the picture. Silent while fast-forwarding.
                 if (ff_now) { if (audio) SDL_ClearQueuedAudio(audio); }
-                else if (audio && SDL_GetQueuedAudioSize(audio) < (Uint32)kAudioFrames * 4 * 5)
-                    SDL_QueueAudio(audio, audio_buf.data(), (Uint32)audio_buf.size() * 2);
+                else if (audio && SDL_GetQueuedAudioSize(audio) < (Uint32)nsamp * 4 * 5)
+                    SDL_QueueAudio(audio, audio_buf.data(), (Uint32)nsamp * 4);
             }
             }
             if (!stopped) {
@@ -532,7 +584,7 @@ int main(int argc, char** argv) {
         uint32_t now = SDL_GetTicks();
         if (emu.cpu && now - last_title >= 1000 && now > warn_until) {   // FPS in the title bar
             char t[160];
-            std::snprintf(t, sizeof t, "Vib-Ribbon - %u fps%s | %ux | Esc launcher | F9 glow | F12 screenshot | hold Tab fast-forward | F10 tap filter: %s", frames, ff_now ? " FAST-FORWARD" : " (target 50)", emu.cpu->gpu.scale(), g_tap.enabled ? "ON" : "OFF");
+            std::snprintf(t, sizeof t, "UC Vib-Ribbon - %u fps%s | %ux | Esc launcher | F8 own CD | F9 glow | F12 screenshot | hold Tab fast-forward | F10 tap filter: %s", frames, ff_now ? " FAST-FORWARD" : "", emu.cpu->gpu.scale(), g_tap.enabled ? "ON" : "OFF");
             SDL_SetWindowTitle(win, t);
             frames = 0; last_title = now;
         }
@@ -540,13 +592,13 @@ int main(int argc, char** argv) {
             double secs = (now - hb_last) / 1000.0, fps = hb_frames / secs;
             fps_min = std::min(fps_min, fps); fps_max = std::max(fps_max, fps); ++hb_count;
             auto& c = *emu.cpu;
-            g_log.note("Heartbeat: %.1f fps (target 50) | game frames +%llu | CPU at %08X | CD %s%s, %llu sectors read, %llu commands | SPU key-ons %llu, SPU read-backs %llu, interrupts %llu | SPU CD input: %s | music (reverb) volume %04X/%04X%s | buttons: %s",
+            g_log.note("Heartbeat: %.1f fps | game frames +%llu | CPU at %08X | CD %s%s, %llu sectors read, %llu commands | SPU key-ons %llu, SPU read-backs %llu, interrupts %llu | SPU CD input: %s | music (reverb) volume %04X/%04X%s | buttons: %s",
                        fps, (unsigned long long)(c.vblanks - last_vblanks), c.pc, c.cd.playing ? "playing audio" : "not playing audio",
                        c.cd.muted ? " (muted)" : "", (unsigned long long)c.cd.sectors_read, (unsigned long long)c.cd.cmds,
                        (unsigned long long)c.spu.key_ons, (unsigned long long)c.dma4_reads, (unsigned long long)c.irqs_taken,
                        c.spu.cd_input_audible() ? "on" : "off", c.spu.rvb_vol_l(), c.spu.rvb_vol_r(),
                        (c.spu.rvb_vol_l() | c.spu.rvb_vol_r()) ? " (music playing)" : " (silent)", pad_names(cur_pad).c_str());
-            if (fps < 45.0 && hb_frames > 0) g_log.note("WARNING: running slow (%.1f fps). The game will play too slowly.", fps);
+            if (fps < (c.gpu.pal() ? 45.0 : 54.0) && hb_frames > 0) g_log.note("WARNING: running slow (%.1f fps). The game will play too slowly.", fps);
             if (c.vblanks == last_vblanks) g_log.note("WARNING: the game did not advance a single frame in %.0f s", secs);
             last_vblanks = c.vblanks;
             uint64_t h = hash_pixels(pixels);
@@ -563,11 +615,15 @@ int main(int argc, char** argv) {
             update_summary("still running"); g_log.save();
             hb_last = now; hb_frames = 0;
         }
-        // Hold the PAL 50 Hz pace; if emulation is slower than that we simply run flat out.
+        // Hold the game's frame rate (PAL 50 Hz = 20 ms, NTSC 60 Hz = 16.67 ms); if emulation is slower we simply run flat out.
         uint32_t spent = SDL_GetTicks() - frame_start;
-        if (emu.cpu && !ff_now && spent > 40) { ++slow_frames; max_frame_ms = std::max(max_frame_ms, spent); }
-        if (emu.cpu && !ff_now && spent < 20) SDL_Delay(20 - spent);
-        else if (!emu.cpu) SDL_Delay(16);
+        const double period = (emu.cpu && !emu.cpu->gpu.pal()) ? 1000.0 / 60.0 : 20.0;
+        if (emu.cpu && !ff_now && spent > 2 * period) { ++slow_frames; max_frame_ms = std::max(max_frame_ms, spent); }
+        if (emu.cpu && !ff_now) {
+            const double budget = period + pace_carry;
+            if (spent < budget) SDL_Delay((Uint32)(budget - spent));
+            pace_carry = std::clamp(budget - (double)(SDL_GetTicks() - frame_start), -period, period);
+        } else if (!emu.cpu) SDL_Delay(16);
     }
     launcher::save_settings(settings_path, lm.s);
     if (ltex) SDL_DestroyTexture(ltex);

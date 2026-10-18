@@ -1,4 +1,4 @@
-# Vib-Ribbon native (PS1, European disc `SCES-028.73`)
+# UC Vib-Ribbon native (PS1: European `SCES-028.73` and Japanese `SCPS-18012` discs)
 
 Runs Vib-Ribbon on Windows from **your own disc image**. No game data is included
 and none should ever be committed (`assets/`, `*.bin`, `*.cue` are gitignored).
@@ -52,6 +52,13 @@ Keyboard: arrows or WASD = D-pad, Z/Space = Cross, X = Circle, C = Square, V = T
 | Controller / keyboard | **Works with a BIOS**: verified headlessly with scripted button taps (CROSS confirms the language, DOWN/UP move through GAME / HOW TO PLAY / LANGUAGE). Without a BIOS the game never starts its pad driver, so input is dead. The game's menus step twice for a D-pad press of 3+ frames (cause not found), so the app passes each new D-pad press for 2 frames only (`pad::TapFilter`, F10 toggles it) |
 | Windows build (`src/main.cpp`, CMake, CI) | Written and type-checked, **never compiled with real SDL** -- first CI run may need a small fix |
 | Gouraud/dither/exact fill rules, semi-transparency edge cases | Approximate |
+
+## 0.14.0
+
+- **NTSC / Japanese disc (`SCPS-18012`) support**: multi-file cue sheets (one .bin per track, with a "Track N" file
+  fallback for renamed files), 60 Hz frame length and 735 audio samples per frame when the game selects NTSC, matching
+  frame pacing, and both discs accepted by the launcher. The JP disc reaches its title screen; see "NTSC / Japanese
+  disc" at the end of this file for what is and is not verified.
 
 ## 0.13.0
 
@@ -199,6 +206,24 @@ Developer hook: `VIBRIBBON_EVENTS="drop=PATH;key=right;key=return;wait=300;quit"
 10 frames) so the whole app can be driven headlessly. New tests: `gpu_hires_test`, `launcher_test`; tools
 `hires_shots` (screenshots + timing at a given scale) and `cmd_census` (which GPU commands the game uses).
 
+## Your own CD (MP3s)
+
+"Play with my own choice of CD" asks you to open the lid and put in a music CD. Here the music comes from MP3 files:
+
+1. **Drop one or more `.mp3` files on the window** (launcher or game). Several files dropped together become the tracks of one
+   CD, in the order they were dropped. The launcher remembers them (`mp3=` lines in `vibribbon-settings.ini`) and shows
+   "OWN CD READY".
+2. When the game asks for a CD, press **F8**. The emulated drive opens its lid (the game sees ShellOpen and "no disc"), about
+   1.2 s later closes it on a virtual **audio CD** made from your MP3s (any sample rate, mono or stereo; resampled to 44.1 kHz).
+   Dropping MP3s while the game is running does the same thing straight away.
+3. When the game asks for its own disc back, press **F8** again (lid opens, closes on the game disc).
+
+The virtual disc answers like a real music CD: `GetTN` / `GetTD` list your tracks, `GetID` says "audio CD", `Play` streams the track
+(and the music goes through the same SPU capture path the game uses to build the ribbon). Decoding happens when you press F8 the
+first time (a few seconds for a long song; the window title says "Reading your MP3s...").
+`tests/cdrom_swap_test.cpp` covers the drive side without any game files. MP3 decoding uses minimp3 (public domain), downloaded
+by CMake next to SDL.
+
 ## Run log (`vibribbon-log.txt`)
 
 The app writes a plain-text log next to the exe (`src/runlog.h`). It is saved every 5 seconds and again when you
@@ -227,7 +252,21 @@ If something gets stuck, send `vibribbon-log.txt` and I can usually tell where.
   drivers (50 fps, log written, clean close); on-screen display and real keyboard/controller input are still unverified.
 - Play a level by hand (button input during gameplay, scoring, level end, return to the menus).
 - Silver / Gold, High scores, Options.
-- "Play with my own choice of CD": needs a way to swap in a different CD image.
+- "Play with my own choice of CD": MP3 support is in (see "Your own CD (MP3s)"); it has not been run against the real game yet.
 - The CD-audio sector data path (`ReadS` data) is still never consumed; the game only needs the SPU capture path.
 - Reverb input from voices (EON) so sound effects get their reverb; hardware-accurate reverb resampling.
 - Find why the menu double-steps on 3+ frame presses (the tap filter is a workaround).
+
+## NTSC / Japanese disc
+
+The Japanese disc (`SCPS-18012`, boot file `SCPS_180.12`) runs in NTSC mode. What changed to support it:
+
+- `disc.h` reads cue sheets with **one .bin per track** (every `FILE` becomes a segment of one continuous disc). If a
+  cue names files that were later renamed (the Redump JP archive does), the loader finds the right `.bin` by its
+  `Track N` in the same folder.
+- The frame length follows the video mode the game sets: PAL 677,376 CPU cycles (50 Hz, 882 audio samples) or NTSC
+  564,480 cycles (60 Hz, 735 samples). The SPU/CD/capture tick is unchanged (768 cycles = 44.1 kHz in both).
+- Frame pacing in the app follows the same mode (20 ms or 16.67 ms), and the log's fps warnings use the right target.
+- The launcher and boot check accept both discs. Use the same BIOS (PSXONPSP660.bin works for both regions).
+- Untested on the JP disc beyond the first screens: the music/ribbon path, menus and tutorial have only been verified
+  on the EU disc so far.

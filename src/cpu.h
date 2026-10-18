@@ -121,10 +121,12 @@ public:
         if (cd.tick(icount)) irq_set(2);
         if ((spu_acc_ += cycles_per_instr) >= 768) { spu_acc_ -= 768; spu_cd_tick(); }
         if (ack_due && icount >= ack_due) { ack_due = 0; sio_irq = true; if (rd(&io[0x4A], 2) & 0x1000) irq_set(7); }
-        if (icount >= next_vblank) { next_vblank += 677376; uint32_t st = rd(&io[0x70], 4) | 1u; wr(&io[0x70], st, 4); ++vblanks; }  // PAL 50 Hz
+        if (icount >= next_vblank) { next_vblank += gpu.pal() ? 677376 : 564480; uint32_t st = rd(&io[0x70], 4) | 1u; wr(&io[0x70], st, 4); ++vblanks; }  // PAL 50 Hz or NTSC 60 Hz, as the game set it
     }
     static constexpr size_t kRing = 16384;          // interleaved stereo int16 slots of CD-DA samples awaiting mixing
     std::vector<int16_t> ring_ = std::vector<int16_t>(kRing, 0), rvb_ring_ = std::vector<int16_t>(kRing, 0), rvb_buf_; size_t ring_r_ = 0, ring_w_ = 0; uint32_t spu_acc_ = 0;
+    // Audio sample frames per video frame at 44.1 kHz: 882 (PAL, 50 Hz) or 735 (NTSC, 60 Hz).
+    int frame_samples() const { return gpu.pal() ? 882 : 735; }
     void spu_cd_tick() {   // one 44.1 kHz tick = 768 CPU cycles
         int16_t s[2] = {0, 0};
         cd.audio_samples(1, s);

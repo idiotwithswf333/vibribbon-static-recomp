@@ -18,14 +18,18 @@ set(SDL_TEST OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(SDL2
   URL https://github.com/libsdl-org/SDL/releases/download/release-2.30.8/SDL2-2.30.8.zip)
 FetchContent_MakeAvailable(SDL2)
+# minimp3 (public domain, header only): decodes the MP3s you drop on the window for the "own CD" feature.
+FetchContent_Declare(minimp3_core URL https://raw.githubusercontent.com/lieff/minimp3/master/minimp3.h DOWNLOAD_NO_EXTRACT TRUE)
+FetchContent_Declare(minimp3_ex URL https://raw.githubusercontent.com/lieff/minimp3/master/minimp3_ex.h DOWNLOAD_NO_EXTRACT TRUE)
+FetchContent_MakeAvailable(minimp3_core minimp3_ex)
 
 add_executable(vibribbon WIN32 src/main.cpp)
-target_include_directories(vibribbon PRIVATE src)
+target_include_directories(vibribbon PRIVATE src ${minimp3_core_SOURCE_DIR} ${minimp3_ex_SOURCE_DIR})
 target_link_libraries(vibribbon PRIVATE SDL2::SDL2main SDL2::SDL2-static)
 
 # Unit tests (run in CI; need no game files)
 enable_testing()
-foreach(t pad_map_test cpu_test runlog_test gpu_hires_test launcher_test glow_test)
+foreach(t pad_map_test cpu_test runlog_test gpu_hires_test launcher_test glow_test cdrom_swap_test)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   if(MSVC)
@@ -38,6 +42,7 @@ add_test(NAME cpu COMMAND cpu_test)
 add_test(NAME runlog COMMAND runlog_test)
 add_test(NAME gpu_hires COMMAND gpu_hires_test)
 add_test(NAME glow COMMAND glow_test)
+add_test(NAME cdrom_swap COMMAND cdrom_swap_test)
 add_test(NAME launcher COMMAND launcher_test WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 if(MSVC)

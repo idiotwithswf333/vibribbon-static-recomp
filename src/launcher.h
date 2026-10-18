@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include "disc.h"
+#include "logo_anim.h"
 #include "vec.h"
 
 namespace launcher {
@@ -27,6 +28,7 @@ struct Settings {
     bool glow = false;   // neon glow (bloom) on at start (F9 still toggles it in game)
     bool ffwd = true;    // hold Tab / right stick to fast-forward
     bool shot = true;    // F12 saves a screenshot
+    std::vector<std::string> mp3;   // dropped MP3 files = the "own CD" played when the game asks for a CD (F8 in game)
 };
 
 inline bool load_settings(const std::string& path, Settings& s) {
@@ -44,6 +46,7 @@ inline bool load_settings(const std::string& path, Settings& s) {
         else if (k == "glow") s.glow = std::atoi(v.c_str()) != 0;
         else if (k == "fastforward") s.ffwd = std::atoi(v.c_str()) != 0;
         else if (k == "screenshots") s.shot = std::atoi(v.c_str()) != 0;
+        else if (k == "mp3" && !v.empty()) s.mp3.push_back(v);
     }
     return true;
 }
@@ -53,6 +56,7 @@ inline bool save_settings(const std::string& path, const Settings& s) {
     f << "# Vib-Ribbon recomp launcher settings (edited by the launcher; safe to delete)\n"
       << "cue=" << s.cue << "\nmods=" << s.mods << "\nupscale=" << std::clamp(s.upscale, 1, 4) << "\n"
       << "glow=" << (s.glow ? 1 : 0) << "\nfastforward=" << (s.ffwd ? 1 : 0) << "\nscreenshots=" << (s.shot ? 1 : 0) << "\n";
+    for (const auto& m : s.mp3) f << "mp3=" << m << "\n";
     return true;
 }
 
@@ -75,8 +79,8 @@ inline DiscCheck check_disc(const std::string& cue) {
     if (!err.empty()) { r.msg = upper(err.substr(0, 60)); return r; }
     std::string boot = disc::boot_file(img);
     if (boot.empty()) { r.msg = "NO PS1 GAME FOUND ON THIS DISC"; return r; }
-    if (boot != "SCES_028.73") { r.msg = "NOT THE VIB-RIBBON EU DISC (" + upper(boot) + ")"; return r; }
-    r.ok = true; r.msg = "OK  VIB-RIBBON EU DISC";
+    if (boot != "SCES_028.73" && boot != "SCPS_180.12") { r.msg = "NOT A VIB-RIBBON DISC (" + upper(boot) + ")"; return r; }
+    r.ok = true; r.msg = boot == "SCPS_180.12" ? "OK  VIB-RIBBON JP DISC (NTSC)" : "OK  VIB-RIBBON EU DISC (PAL)";
     return r;
 }
 
@@ -139,6 +143,7 @@ struct Model {
         s.mods = p; zip = check_zip(p);
         say(zip.ok ? "MODS ZIP ADDED (MODS ARE NOT SUPPORTED YET)" : zip.msg);
     }
+    void add_mp3(const std::string& p) { s.mp3.push_back(p); }
     void clear_mods() { s.mods.clear(); zip = ZipCheck(); say("MODS CLEARED"); }
     void set_upscale(int n) { s.upscale = std::clamp(n, 1, 4); }
     static bool is_opt(int f) { return f == F_OPT_FF || f == F_OPT_SHOT; }   // main-page check boxes (glow lives on the mods page)
@@ -244,6 +249,25 @@ inline std::string shorten(const std::string& s, size_t max) {   // keeps the st
     return s.substr(0, max - 5) + "~" + s.substr(s.size() - 4);
 }
 
+// The animated logo (src/logo_anim.h): decoded once, then one grey frame is blended onto the canvas per call.
+inline const std::vector<std::vector<uint8_t>>& logo_frames() {
+    static std::vector<std::vector<uint8_t>> fr;
+    if (fr.empty()) {
+        for (int n = 0; n < logo_anim::kFrames; ++n) {
+            std::vector<uint8_t> g; g.reserve((size_t)logo_anim::kW * logo_anim::kH);
+            for (unsigned i = 0; i + 1 < logo_anim::kSize[n]; i += 2) g.insert(g.end(), logo_anim::kData[n][i + 1], logo_anim::kData[n][i]);
+            g.resize((size_t)logo_anim::kW * logo_anim::kH, 0); fr.push_back(std::move(g));
+        }
+    }
+    return fr;
+}
+inline int logo_frame_at(uint32_t ms) { return (int)((ms / (uint32_t)logo_anim::kDelayMs) % (uint32_t)logo_anim::kFrames); }
+inline void draw_logo(vec::Canvas& cv, int frame, int x0, int y0) {
+    const auto& g = logo_frames()[(size_t)(frame % logo_anim::kFrames)];
+    for (int y = 0; y < logo_anim::kH; ++y)
+        for (int x = 0; x < logo_anim::kW; ++x) { uint8_t v = g[(size_t)y * logo_anim::kW + x]; if (v) cv.blend(x0 + x, y0 + y, vec::rgb(235, 235, 235), v / 255.0f); }
+}
+
 // ---- drawing -----------------------------------------------------------------------------------------------------
 inline void draw(vec::Canvas& cv, const Model& m, int frame = 0) {
     using vec::rgb;
@@ -252,7 +276,7 @@ inline void draw(vec::Canvas& cv, const Model& m, int frame = 0) {
     cv.clear();
 
     // title
-    vec::text(cv, 960, 55, 13, "VIB-RIBBON", WHITE, 7.0f, 1);
+    vec::text(cv, 960, 55, 13, "UC VIB-RIBBON", WHITE, 7.0f, 1);
     vec::text(cv, 960, 160, 5, "RECOMP LAUNCHER", DIM, 3.5f, 1);
 
     // a ribbon with every obstacle (loop, wave, pit, block), across the top: the game's own motif
@@ -270,7 +294,8 @@ inline void draw(vec::Canvas& cv, const Model& m, int frame = 0) {
         cv.polyline(r, WHITE, 3.5f);
     }
 
-    vec::text(cv, 1860, 100, 3.2f, "V0.13.0", DIM, 2.2f, 2);
+    draw_logo(cv, frame, 40, 20);   // animated logo, top left
+    vec::text(cv, 1860, 100, 3.2f, "V1.0.0", DIM, 2.2f, 2);
     if (m.page_mods) {   // ---- the LIST MODS page: mods zip + neon glow ----
         auto bub = [&](int f, uint32_t col, float width) {
             Ellipse e = shape_of(f, true); const bool hv = m.hover == f, fo = m.focus == f;
@@ -349,7 +374,7 @@ inline void draw(vec::Canvas& cv, const Model& m, int frame = 0) {
         static const char* caps[4] = {"ORIGINAL", "", "", "~1080P"};
         for (int i = 0; i < 4; ++i) if (caps[i][0]) vec::text(cv, shape_of(F_UP1 + i).cx, 650, 3.4f, caps[i], DIM, 2.2f, 1);
         const int n = m.s.upscale;
-        std::string info = n == 1 ? "ORIGINAL PS1 PIXELS (512 X 256)" : "LINES DRAWN AT " + std::to_string(512 * n) + " X " + std::to_string(256 * n) + " AND SMOOTHED";
+        std::string info = n == 1 ? "ORIGINAL PS1 PIXELS" : "LINES DRAWN AT " + std::to_string(n) + "X THE ORIGINAL SIZE, SMOOTHED";
         vec::text(cv, 960, 686, 4, info, WHITE, 2.5f, 1);
     }
     // ---- 4: options (check boxes) ----
@@ -380,9 +405,9 @@ inline void draw(vec::Canvas& cv, const Model& m, int frame = 0) {
     }
     // ---- toast + footer ----
     if (!m.toast.empty()) vec::text(cv, 960, 1008, fit(m.toast, 4.0f, 1500), m.toast, VIOLET, 2.6f, 1);
+    else if (!m.s.mp3.empty()) { const std::string t = "OWN CD READY: " + std::to_string(m.s.mp3.size()) + (m.s.mp3.size() == 1 ? " MP3" : " MP3S") + "  -  PRESS F8 IN THE GAME WHEN IT ASKS FOR A CD"; vec::text(cv, 960, 1008, fit(t, 3.6f, 1500), t, VIOLET, 2.4f, 1); }
     vec::text(cv, 60, 1048, 3.2f, m.bios_ok ? "BIOS: " + upper(m.bios_name) : "BIOS MISSING - DROP BIOS.BIN HERE", m.bios_ok ? GREEN : RED, 2.2f, 0);
     vec::text(cv, 1860, 1048, 3.2f, "ARROWS + ENTER   F11 FULLSCREEN   ESC QUIT", DIM, 2.2f, 2);
-    (void)frame;
 }
 
 }  // namespace launcher

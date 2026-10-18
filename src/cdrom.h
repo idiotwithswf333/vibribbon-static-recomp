@@ -8,7 +8,9 @@
 #include <deque>
 #include <functional>
 #include <vector>
+#include <memory>
 #include "disc.h"
+#include "vcd.h"
 
 namespace hw {
 
@@ -27,6 +29,16 @@ public:
     std::vector<std::string> cmd_hist;   // every command with timestamp, for diagnostics
     std::vector<uint32_t> setloc_hist;   // every Setloc target (LBA), for diagnostics
     std::vector<std::string> dbg_log;   // first commands, for diagnostics
+
+    // ---- "own CD": swapping the disc in the drive for a virtual audio CD (the user's MP3s) ----
+    // The lid opens now (Getstat shows ShellOpen, motor off), stays open ~1.2 s, then closes with `d` inside (nullptr =
+    // the original game disc again). While `vcd` is set the drive is an audio-only disc: GetTN / GetTD / GetlocP /
+    // Play use its tracks and GetID answers "audio CD", exactly what a real drive reports for a music CD.
+    std::shared_ptr<const vcd::Disc> vcd;
+    void request_swap(std::shared_ptr<const vcd::Disc> d) { swap_to_ = std::move(d); swap_pending_ = true; swap_phase_ = 0; }
+    bool lid_open() const { return lid_open_; }
+    bool swap_busy() const { return swap_pending_; }
+    bool own_cd() const { return vcd != nullptr; }
 
     uint8_t read8(uint32_t reg) {
         switch (reg) {
@@ -69,7 +81,8 @@ public:
             if (playing) {
                 if (!da_loaded) {
                     uint32_t sz = 0; da_sec.assign(2352, 0);
-                    if (!img || !img->raw_sector(da_lba, da_sec.data(), &sz) || sz != 2352) { playing = false; }
+                    if (vcd) { if (!vcd->sector(da_lba, da_sec.data())) playing = false; }   // past the last track = lead-out: the drive stops
+                    else if (!img || !img->raw_sector(da_lba, da_sec.data(), &sz) || sz != 2352) { playing = false; }
                     da_loaded = true; da_off = 0;
                 }
                 if (playing) {
@@ -90,6 +103,16 @@ public:
     // Returns true when I_STAT bit 2 should be raised.
     bool tick(uint64_t now) {
         now_ = now;
+        if (swap_pending_) {
+            if (swap_phase_ == 0) {   // lid opens: spinning stops, reading/playing is cut off
+                lid_open_ = true; shell_flag_ = true; playing = false; reading = false;
+                q.erase(std::remove_if(q.begin(), q.end(), [](const Ev& e) { return e.sector; }), q.end());
+                swap_t_ = now + kLidOpenCycles; swap_phase_ = 1;
+            } else if (now >= swap_t_) {   // lid closes on the new disc
+                lid_open_ = false; vcd = swap_to_; swap_to_.reset(); swap_pending_ = false;
+                loc = 0; da_lba = 0; da_loaded = false; data_buf.clear(); data_pos = 0;
+            }
+        }
         if (q.empty() || now < q.front().t || ifr != 0) return false;
         Ev e = q.front(); q.erase(q.begin());
         if (e.sector) {
@@ -116,7 +139,12 @@ private:
 
     static constexpr uint64_t kFirst = 15000, kSecond = 30000, kSector = 90000;   // ~375 sectors/s: faster than a real 2x drive (150/s) but slower than the real kernel IRQ path
 
-    uint8_t stat() const { return playing ? 0x82 : 0x02; }
+    std::shared_ptr<const vcd::Disc> swap_to_; bool swap_pending_ = false, lid_open_ = false, shell_flag_ = false; int swap_phase_ = 0; uint64_t swap_t_ = 0;
+    static constexpr uint64_t kLidOpenCycles = 40000000;   // ~1.2 s of emulated time with the lid open
+    // Status byte: bit1 motor on, bit7 playing, bit4 ShellOpen (lid open now, or opened since the last Getstat).
+    uint8_t stat() const { return (uint8_t)((lid_open_ ? 0x00 : (playing ? 0x82 : 0x02)) | (shell_flag_ ? 0x10 : 0x00)); }
+    const std::vector<uint32_t>& tracks() const { static const std::vector<uint32_t> none; return vcd ? vcd->starts : (img ? img->track_starts() : none); }
+    uint32_t total_sectors() const { return vcd ? vcd->sectors : (img ? img->total_sectors() : 0); }
     uint8_t stat_reading() const { return 0x22; }
     static uint8_t bcd(unsigned v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
     static unsigned unbcd(uint8_t b) { return (b >> 4) * 10 + (b & 15); }
@@ -133,7 +161,8 @@ private:
     void load_sector() {
         uint8_t raw[2352]; uint32_t sz = 0;
         data_buf.clear(); data_pos = 0;
-        if (img && img->raw_sector(loc, raw, &sz)) {
+        if (vcd) { data_buf.assign(2048, 0); if (vcd->sector(loc, raw)) data_buf.assign(raw, raw + 2048); }   // audio disc: no files, just raw audio bytes
+        else if (img && img->raw_sector(loc, raw, &sz)) {
             if (sz == 2352) {
                 if (mode & 0x20) data_buf.assign(raw + 12, raw + 12 + 2340);
                 else data_buf.assign(raw + img->data_offset(), raw + img->data_offset() + 2048);
@@ -150,7 +179,7 @@ private:
         uint64_t t = now_ + kFirst;
         busy_until = t;
         switch (c) {
-        case 0x01: push(t, 3, {stat()}); break;                                   // Getstat
+        case 0x01: push(t, 3, {stat()}); if (!lid_open_) shell_flag_ = false; break;   // Getstat (reading it after the lid closed clears ShellOpen)
         case 0x02: if (p.size() >= 3) {                                          // Setloc
                        unsigned f = (unbcd(p[0]) * 60 + unbcd(p[1])) * 75 + unbcd(p[2]);
                        loc = f >= 150 ? f - 150 : 0;
@@ -174,22 +203,22 @@ private:
         case 0x03: {                                                           // Play (CD-DA)
             ++play_cmds;
             unsigned tr = p.empty() ? 0 : unbcd(p[0]);
-            if (img && tr >= 1 && tr <= img->track_starts().size()) da_lba = img->track_starts()[tr - 1]; else da_lba = loc;
+            if (tr >= 1 && tr <= tracks().size()) da_lba = tracks()[tr - 1]; else da_lba = loc;
             da_off = 0; da_loaded = false; playing = true; reading = false;
             q.erase(std::remove_if(q.begin(), q.end(), [](const Ev& e){ return e.sector; }), q.end());
             push(t, 3, {stat()}); break; }
         case 0x11: {                                                           // GetlocP
             uint32_t lba = playing ? da_lba : loc, tr = 1;
-            if (img) { auto& ts = img->track_starts(); for (size_t k = 0; k < ts.size(); ++k) if (ts[k] <= lba) tr = (uint32_t)k + 1; }
-            uint32_t base = (img && tr >= 1 && tr <= img->track_starts().size()) ? img->track_starts()[tr - 1] : 0;
+            { auto& ts = tracks(); for (size_t k = 0; k < ts.size(); ++k) if (ts[k] <= lba) tr = (uint32_t)k + 1; }
+            uint32_t base = (tr >= 1 && tr <= tracks().size()) ? tracks()[tr - 1] : 0;
             uint32_t rel = lba >= base ? lba - base : 0, ab = lba + 150;
             push(t, 3, {bcd(tr), 0x01, bcd(rel / 75 / 60), bcd(rel / 75 % 60), bcd(rel % 75), bcd(ab / 75 / 60), bcd(ab / 75 % 60), bcd(ab % 75)});
             break; }
         case 0x0E: if (!p.empty()) mode = p[0]; push(t, 3, {stat()}); break;     // Setmode
-        case 0x13: push(t, 3, {stat(), 0x01, bcd((unsigned)(img ? std::max<size_t>(1, img->track_starts().size()) : 1))}); break;  // GetTN
+        case 0x13: push(t, 3, {stat(), 0x01, bcd((unsigned)std::max<size_t>(1, tracks().size()))}); break;  // GetTN
         case 0x14: {                                                              // GetTD
             unsigned n = p.empty() ? 0 : unbcd(p[0]); uint32_t fr = 0;
-            if (img) { auto& ts = img->track_starts(); if (n >= 1 && n <= ts.size()) fr = ts[n - 1]; else fr = img->total_sectors(); }
+            { auto& ts = tracks(); if (n >= 1 && n <= ts.size()) fr = ts[n - 1]; else fr = total_sectors(); }
             fr += 150;
             push(t, 3, {stat(), bcd(fr / 75 / 60), bcd(fr / 75 % 60)}); break; }
         case 0x15: case 0x16: push(t, 3, {stat()}); push(t + kSecond, 2, {stat()}); break;   // SeekL / SeekP
@@ -197,8 +226,11 @@ private:
             if (!p.empty() && p[0] == 0x20) push(t, 3, {0x94, 0x09, 0x19, 0xC0});
             else push(t, 5, {0x11, 0x40});
             break;
-        case 0x1A: push(t, 3, {stat()});                                          // GetID: licensed Mode2 disc, SCEE region
-                   push(t + kSecond, 2, {0x02, 0x00, 0x20, 0x00, 'S', 'C', 'E', 'E'}); break;
+        case 0x1A: push(t, 3, {stat()});                                          // GetID
+                   if (lid_open_) push(t + kSecond, 5, {0x08, 0x40, 0, 0, 0, 0, 0, 0});          // lid open: no disc
+                   else if (vcd) push(t + kSecond, 5, {0x0A, 0x90, 0, 0, 0, 0, 0, 0});          // a music CD: not a game disc ("audio CD" answer)
+                   else push(t + kSecond, 2, {0x02, 0x00, 0x20, 0x00, 'S', 'C', 'E', 'E'});    // licensed Mode2 disc, SCEE region
+                   break;
         case 0x1E: push(t, 3, {stat()}); push(t + kSecond * 3, 2, {stat()}); break;  // ReadTOC
         default: push(t, 5, {(uint8_t)(stat() | 1), 0x40}); break;                // unknown: error
         }

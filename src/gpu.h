@@ -23,6 +23,7 @@ public:
     // display() then reads from `hi`. At scale 1 nothing changes and no extra memory is used.
     float line_width = 1.0f;   // line thickness in original pixels (only used when scale > 1)
     int scale() const { return scale_; }
+    bool pal() const { return pal_ != 0; }   // video mode the game selected: PAL 50 Hz or NTSC ~60 Hz
     void set_scale(int n) {
         n = std::clamp(n, 1, 4);
         if (n == scale_) return;

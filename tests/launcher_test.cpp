@@ -26,6 +26,13 @@ int main(int argc, char** argv) {
         std::ofstream(f) << "upscale=99\ncue=x\n"; launcher::Settings u; launcher::load_settings(f, u); CHECK(u.upscale == 4);   // clamped
         launcher::Settings none; CHECK(!launcher::load_settings((d / "missing.ini").string(), none) && none.upscale == 1);
     }
+    // ---- own-CD playlist (dropped MP3s) survives a round trip, in order ----
+    {
+        launcher::Settings s; s.cue = "x.cue"; s.mp3 = {"C:\\music\\one.mp3", "C:\\music\\two.mp3"};
+        std::string f = (d / "mp3.ini").string(); CHECK(launcher::save_settings(f, s));
+        launcher::Settings t; CHECK(launcher::load_settings(f, t)); CHECK(t.mp3.size() == 2 && t.mp3[0] == s.mp3[0] && t.mp3[1] == s.mp3[1]);
+        launcher::Settings none; std::ofstream(f) << "cue=x\n"; launcher::load_settings(f, none); CHECK(none.mp3.empty());
+    }
     // ---- zip check -------------------------------------------------------------------------------------------------------
     {
         std::string z = (d / "m.zip").string();

@@ -224,6 +224,9 @@ first time (a few seconds for a long song; the window title says "Reading your M
 `tests/cdrom_swap_test.cpp` covers the drive side without any game files. MP3 decoding uses minimp3 (public domain), downloaded
 by CMake next to SDL.
 
+After an F8 swap the log also lists the next ~800 CD commands/answers (`CD: cmd ...` / `CD: answer ...`), so if the game still asks for a CD,
+send `vibribbon-log.txt` (press F8, wait ~20 s, press Esc).
+
 ## Run log (`vibribbon-log.txt`)
 
 The app writes a plain-text log next to the exe (`src/runlog.h`). It is saved every 5 seconds and again when you

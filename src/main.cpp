@@ -356,8 +356,14 @@ int main(int argc, char** argv) {
     // ---- Feature: own CD. Drop .mp3 files on the window (any time); F8 (or dropping while playing) swaps the drive's disc for
     // a virtual audio CD made from them, the way you would open the lid and put your own CD in. F8 again puts the game disc back.
     auto note_title = [&](const std::string& m, uint32_t ms) { SDL_SetWindowTitle(win, m.c_str()); warn_until = SDL_GetTicks() + ms; g_log.note("%s", m.c_str()); };
+    auto start_cd_trace = [&]() {   // log what the game asks the drive for after a disc swap (sent in vibribbon-log.txt)
+        if (!emu.cpu) return;
+        emu.cpu->cd.on_trace = [](const std::string& m) { g_log.note("CD: %s", m.c_str()); };
+        emu.cpu->cd.trace_left = 800;
+    };
     auto insert_own_cd = [&]() {
         if (!emu.cpu) return;
+        g_log.note("F8/drop: own CD requested (%zu MP3s in the list)", lm.s.mp3.size());
         if (lm.s.mp3.empty()) { note_title("No MP3s yet: drop .mp3 files on this window, then press F8", 5000); return; }
         if (own_cd_dirty || !own_cd) {
             note_title("Reading your MP3s...", 60000); SDL_PumpEvents();
@@ -370,12 +376,12 @@ int main(int argc, char** argv) {
             if (d->tracks() == 0) { note_title("Could not read any MP3 (" + last_err + ")", 6000); return; }
             own_cd = d; own_cd_dirty = false;
         }
-        emu.cpu->cd.request_swap(own_cd); own_cd_in = true;
+        start_cd_trace(); emu.cpu->cd.request_swap(own_cd); own_cd_in = true;
         note_title("CD lid open - your MP3 CD (" + std::to_string(own_cd->tracks()) + (own_cd->tracks() == 1 ? " track" : " tracks") + ") goes in. F8 puts the game disc back", 6000);
     };
     auto restore_game_cd = [&]() {
         if (!emu.cpu) return;
-        emu.cpu->cd.request_swap(nullptr); own_cd_in = false;
+        start_cd_trace(); emu.cpu->cd.request_swap(nullptr); own_cd_in = false;
         note_title("CD lid open - game disc goes back in", 4000);
     };
 

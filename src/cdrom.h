@@ -36,6 +36,8 @@ public:
     // Play use its tracks and GetID answers "audio CD", exactly what a real drive reports for a music CD.
     std::shared_ptr<const vcd::Disc> vcd;
     void request_swap(std::shared_ptr<const vcd::Disc> d) { swap_to_ = std::move(d); swap_pending_ = true; swap_phase_ = 0; }
+    // Diagnostics: while trace_left > 0 every command the game sends and every answer it gets is passed to on_trace.
+    std::function<void(const std::string&)> on_trace; int trace_left = 0;
     bool lid_open() const { return lid_open_; }
     bool swap_busy() const { return swap_pending_; }
     bool own_cd() const { return vcd != nullptr; }
@@ -121,6 +123,11 @@ public:
             e.resp = {stat_reading()}; e.irq = 1;
             schedule_sector(now);
         }
+        if (on_trace && trace_left > 0) {
+            --trace_left; char b[120]; int n = std::snprintf(b, sizeof b, "answer INT%d:", e.irq);
+            for (size_t i = 0; i < e.resp.size() && i < 8 && n < 100; ++i) n += std::snprintf(b + n, sizeof b - n, " %02X", e.resp[i]);
+            on_trace(b);
+        }
         resp.assign(e.resp.begin(), e.resp.end());
         ifr = (uint8_t)e.irq;
         return (ier & ifr) != 0;
@@ -175,6 +182,11 @@ private:
         if (cmd_hist.size() < 100000) { char b[80]; std::snprintf(b, sizeof b, "%llu cmd %02X np=%zu p=%02X %02X %02X", (unsigned long long)now_, c, params.size(), params.size()>0?params[0]:0, params.size()>1?params[1]:0, params.size()>2?params[2]:0); cmd_hist.push_back(b); }
         if (dbg_log.size() < 40) { char b[96]; std::snprintf(b, sizeof b, "cmd %02X params=%zu p0=%02X p1=%02X p2=%02X", c, params.size(), params.size()>0?params[0]:0, params.size()>1?params[1]:0, params.size()>2?params[2]:0); dbg_log.push_back(b); }
         std::vector<uint8_t> p(params.begin(), params.end());
+        if (on_trace && trace_left > 0) {
+            --trace_left; char b[120]; int n = std::snprintf(b, sizeof b, "cmd %02X (lid %s, %s):", c, lid_open_ ? "open" : "closed", vcd ? "own CD" : "game disc");
+            for (size_t i = 0; i < p.size() && i < 6; ++i) n += std::snprintf(b + n, sizeof b - n, " %02X", p[i]);
+            on_trace(b);
+        }
         params.clear(); resp.clear();
         uint64_t t = now_ + kFirst;
         busy_until = t;

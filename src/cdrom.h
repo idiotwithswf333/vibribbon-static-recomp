@@ -38,13 +38,14 @@ public:
     void request_swap(std::shared_ptr<const vcd::Disc> d) { swap_to_ = std::move(d); swap_pending_ = true; swap_phase_ = 0; }
     // Diagnostics: while trace_left > 0 every command the game sends and every answer it gets is passed to on_trace.
     std::function<void(const std::string&)> on_trace; int trace_left = 0;
-    void trace_line(const std::string& m) {   // a command/answer pair identical to the previous pair is only counted
+    void trace_line(const std::string& m) {   // commands: skipped if the same as one of the last two; answers: skipped for those, and INT1 (sector ready)
         const bool is_cmd = m.compare(0, 3, "cmd") == 0;
-        std::string& last = is_cmd ? last_cmd_ : last_ans_;
-        if (m == last && (is_cmd || skip_ans_)) { skip_ans_ = is_cmd; if (is_cmd) ++trace_rep_; return; }
-        if (is_cmd && trace_rep_) { on_trace("   (that command and its answer repeated " + std::to_string(trace_rep_) + " more times)"); trace_rep_ = 0; }
-        if (!is_cmd) skip_ans_ = false; else skip_ans_ = false;
-        last = m; --trace_left; on_trace(m);
+        if (is_cmd) {
+            if (m == last_cmd_ || m == prev_cmd_) { skip_ans_ = true; ++trace_rep_; return; }
+            if (trace_rep_) { on_trace("   (" + std::to_string(trace_rep_) + " repeated commands/answers left out)"); trace_rep_ = 0; }
+            prev_cmd_ = last_cmd_; last_cmd_ = m; skip_ans_ = false;
+        } else if (skip_ans_ || m.compare(0, 11, "answer INT1") == 0) return;
+        --trace_left; on_trace(m);
     }
     bool lid_open() const { return lid_open_; }
     bool swap_busy() const { return swap_pending_; }
@@ -107,7 +108,7 @@ public:
             out[2 * i] = (int16_t)std::clamp(l, -32768, 32767); out[2 * i + 1] = (int16_t)std::clamp(r, -32768, 32767);
         }
     }
-    uint8_t data_byte() { return data_pos < data_buf.size() ? data_buf[data_pos++] : 0; }
+    uint8_t data_byte() { if (data_pos < data_buf.size()) { ++data_bytes_read_; return data_buf[data_pos++]; } return 0; }
     uint32_t data_word() { uint32_t w = 0; for (int i = 0; i < 4; ++i) w |= (uint32_t)data_byte() << (8 * i); return w; }
 
     // Returns true when I_STAT bit 2 should be raised.
@@ -127,9 +128,15 @@ public:
         Ev e = q.front(); q.erase(q.begin());
         if (e.sector) {
             if (!reading) return false;
-            load_sector();
-            e.resp = {stat_reading()}; e.irq = 1;
-            schedule_sector(now);
+            if (vcd && loc >= vcd->sectors) {   // read past the end of the music CD: the drive stops at the lead-out (INT4 "data end")
+                reading = false; e.resp = {0x02}; e.irq = 4;
+                if (on_trace && trace_left > 0) { --trace_left; on_trace("reading reached the lead-out (end of the own CD)"); }
+            } else {
+                load_sector();
+                e.resp = {stat_reading()}; e.irq = 1;
+                schedule_sector(now);
+                if (on_trace && trace_left > 0 && (sectors_read % 2000) == 0) { --trace_left; on_trace("reading: next sector " + std::to_string(loc) + ", game has taken " + std::to_string(data_bytes_read_) + " data bytes so far"); }
+            }
         }
         if (on_trace && trace_left > 0) {
             char b[120]; int n = std::snprintf(b, sizeof b, "answer INT%d:", e.irq);
@@ -154,7 +161,7 @@ private:
 
     static constexpr uint64_t kFirst = 15000, kSecond = 30000, kSector = 90000;   // ~375 sectors/s: faster than a real 2x drive (150/s) but slower than the real kernel IRQ path
 
-    std::string last_cmd_, last_ans_; int trace_rep_ = 0; bool skip_ans_ = false;
+    std::string last_cmd_, prev_cmd_; int trace_rep_ = 0; bool skip_ans_ = false; uint64_t data_bytes_read_ = 0;
     std::shared_ptr<const vcd::Disc> swap_to_; bool swap_pending_ = false, lid_open_ = false, shell_flag_ = false; int swap_phase_ = 0; uint64_t swap_t_ = 0;
     static constexpr uint64_t kLidOpenCycles = 40000000;   // ~1.2 s of emulated time with the lid open
     // Status byte: bit1 motor on, bit7 playing, bit4 ShellOpen (lid open now, or opened since the last Getstat).
